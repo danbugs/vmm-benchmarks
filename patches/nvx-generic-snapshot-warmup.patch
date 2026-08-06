@@ -1,0 +1,12 @@
+diff --git a/alpine/snapshot-trampoline.py b/alpine/snapshot-trampoline.py
+index f581e82..15a8daa 100644
+--- a/alpine/snapshot-trampoline.py
++++ b/alpine/snapshot-trampoline.py
+@@ -83,6 +83,7 @@ def main(argv: list[str]) -> None:
+     mount, warmup, app = parse_args(argv)
+     if warmup:
+         warm_interpreter()
++    exec(compile("pass", "<snapshot-warmup>", "exec"), {"__name__": "__main__"})
+     request_snapshot()
+     if mount is not None:
+         mount_hostfs(*mount)

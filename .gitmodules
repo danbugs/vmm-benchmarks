@@ -1,0 +1,9 @@
+[submodule "nvx"]
+	path = nvx
+	url = https://github.com/ppenna/nvx.git
+[submodule "nanvix-python"]
+	path = nanvix-python
+	url = https://github.com/nanvix/nanvix-python
+[submodule "hyperlight-unikraft"]
+	path = hyperlight-unikraft
+	url = https://github.com/hyperlight-dev/hyperlight-unikraft
