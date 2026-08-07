@@ -40,6 +40,7 @@ BUILD_RECEIPTS_DIR = SCRIPT_DIR / ".build-receipts"
 SAMPLES_DIR = SCRIPT_DIR / "samples"
 HELLO_SAMPLE = SAMPLES_DIR / "hello.py"
 PANDOC_DOCX_SAMPLE = SAMPLES_DIR / "pandoc_docx.py"
+PANDOC_STDLIB_SAMPLE = SAMPLES_DIR / "pandoc_docx_stdlib.py"
 NVX_PYTHON_INITRD = NVX_DIR / "build" / "initramfs-python.cpio.gz"
 PYPANDOC_VERSION = "1.17"
 PYPANDOC_WHEEL = f"pypandoc-{PYPANDOC_VERSION}-py3-none-any.whl"
@@ -67,6 +68,16 @@ HYPERLIGHT_DRIVER_KERNEL = (
 )
 HYPERLIGHT_DRIVER_INITRD = HYPERLIGHT_DRIVER_DIR / "python-agent-driver-initrd.cpio"
 
+# Per-workload Hyperlight images from GHCR (each contains /kernel + /initrd.cpio)
+HYPERLIGHT_WORKLOAD_IMAGE: dict[str, str] = {
+    "hello": "ghcr.io/danbugs/vmm-benchmarks/pyhl:latest",
+    "pandoc-docx-stdlib": "ghcr.io/danbugs/vmm-benchmarks/pyhl:latest",
+    "pandoc-native": "ghcr.io/danbugs/vmm-benchmarks/pandoc-native:latest",
+    "nodejs-hello": "ghcr.io/danbugs/vmm-benchmarks/nodejs:latest",
+}
+# Workloads using pyhl mode (call_named with script); others use generic (call_run)
+HYPERLIGHT_PYHL_WORKLOADS = {"hello", "pandoc-docx-stdlib"}
+
 VMM_ORDER = ("nvx", "nanvix", "hyperlight")
 VMM_LABELS = {
     "nvx": "NVX (OpenVMM + Linux)",
@@ -79,36 +90,60 @@ VMM_PLOT_COLORS = {
     "nanvix": "#16a34a",
     "hyperlight": "#dc2626",
 }
-WORKLOAD_ORDER = ("hello", "pandoc-docx")
+WORKLOAD_ORDER = ("hello", "pandoc-docx-stdlib", "pandoc-docx", "pandoc-native", "nodejs-hello")
 WORKLOAD_LABELS = {
     "hello": "Python hello.py",
+    "pandoc-docx-stdlib": "Python stdlib Markdown-to-DOCX",
     "pandoc-docx": "Python + pypandoc Markdown to DOCX",
+    "pandoc-native": "Pandoc native Markdown-to-DOCX",
+    "nodejs-hello": "Node.js hello",
 }
 WORKLOAD_TITLES = {
     "hello": "Python Hello-World",
+    "pandoc-docx-stdlib": "Python stdlib Markdown-to-DOCX",
     "pandoc-docx": "Python pypandoc Markdown-to-DOCX",
+    "pandoc-native": "Pandoc native Markdown-to-DOCX",
+    "nodejs-hello": "Node.js Hello-World",
 }
 WORKLOAD_VMMS: dict[str, tuple[str, ...]] = {
     "hello": VMM_ORDER,
+    "pandoc-docx-stdlib": ("hyperlight",),
     "pandoc-docx": ("nvx",),
+    "pandoc-native": ("hyperlight",),
+    "nodejs-hello": ("hyperlight",),
 }
-WORKLOAD_SAMPLES = {
+WORKLOAD_SAMPLES: dict[str, Path | None] = {
     "hello": HELLO_SAMPLE,
+    "pandoc-docx-stdlib": PANDOC_STDLIB_SAMPLE,
     "pandoc-docx": PANDOC_DOCX_SAMPLE,
+    "pandoc-native": None,
+    "nodejs-hello": None,
 }
 WORKLOAD_MARKERS = {
     "hello": "hello world",
+    "pandoc-docx-stdlib": "PANDOC_DOCX_OK",
     "pandoc-docx": "PANDOC_DOCX_OK",
+    "pandoc-native": "PANDOC_DOCX_OK",
+    "nodejs-hello": "hello",
 }
 RSS_VMM_ORDER = ("nanvix", "nvx", "hyperlight")
-GUEST_MEMORY_MIB = {
+GUEST_MEMORY_MIB: dict[str, dict[str, int]] = {
     "hello": {
         "nvx": 1024,
         "nanvix": 256,
         "hyperlight": 2560,
     },
+    "pandoc-docx-stdlib": {
+        "hyperlight": 2560,
+    },
     "pandoc-docx": {
         "nvx": 1024,
+    },
+    "pandoc-native": {
+        "hyperlight": 2560,
+    },
+    "nodejs-hello": {
+        "hyperlight": 512,
     },
 }
 MODE_ORDER = ("cold", "restore")
@@ -501,33 +536,7 @@ def build_projects(selected: set[str]) -> None:
 
     if "hyperlight" in selected:
         (BUILD_RECEIPTS_DIR / "hyperlight.json").unlink(missing_ok=True)
-        run_checked(["cargo", "build", "--release"], cwd=HYPERLIGHT_DIR / "host")
-        extract_docker_artifact(
-            HYPERLIGHT_DRIVER_INITRD_IMAGE,
-            "/initrd.cpio",
-            HYPERLIGHT_DRIVER_INITRD,
-        )
-        extract_docker_artifact(
-            HYPERLIGHT_DRIVER_KERNEL_IMAGE,
-            "/kernel",
-            HYPERLIGHT_DRIVER_KERNEL,
-        )
         run_checked(["cargo", "build", "--release"], cwd=HYPERLIGHT_RUNNER_DIR)
-        write_build_receipt(
-            "hyperlight",
-            {
-                "kernel_image": HYPERLIGHT_DRIVER_KERNEL_IMAGE,
-                "initrd_image": HYPERLIGHT_DRIVER_INITRD_IMAGE,
-            },
-            {
-                "kernel": HYPERLIGHT_DRIVER_KERNEL,
-                "initrd": HYPERLIGHT_DRIVER_INITRD,
-                "runner": HYPERLIGHT_RUNNER_DIR
-                / "target"
-                / "release"
-                / "vmm-hyperlight-runner.exe",
-            },
-        )
 
 
 def run_control(
@@ -639,7 +648,12 @@ def prepare(
                     f"{previous_workload!r}, not {workload!r}; choose a new "
                     "--output directory"
                 )
-    sample = stage_sample(output_dir, artifacts, WORKLOAD_SAMPLES[workload])
+    workload_sample_source = WORKLOAD_SAMPLES[workload]
+    sample: Path | None = (
+        stage_sample(output_dir, artifacts, workload_sample_source)
+        if workload_sample_source is not None
+        else None
+    )
     memory = GUEST_MEMORY_MIB[workload]
     marker = WORKLOAD_MARKERS[workload]
     warmup_imports = (
@@ -893,27 +907,27 @@ def prepare(
         runner = require_file(
             HYPERLIGHT_RUNNER_DIR / "target" / "release" / "vmm-hyperlight-runner.exe"
         )
-        kernel = require_file(HYPERLIGHT_DRIVER_KERNEL)
-        initrd = require_file(HYPERLIGHT_DRIVER_INITRD)
-        require_build_receipt(
-            "hyperlight",
-            {
-                "kernel_image": HYPERLIGHT_DRIVER_KERNEL_IMAGE,
-                "initrd_image": HYPERLIGHT_DRIVER_INITRD_IMAGE,
-            },
-            {
-                "kernel": kernel,
-                "initrd": initrd,
-                "runner": runner,
-            },
-        )
+
+        # Pull workload-specific kernel/initrd from GHCR
+        hl_image = HYPERLIGHT_WORKLOAD_IMAGE[workload]
+        hl_kernel = hyperlight_work / "kernel"
+        hl_initrd = hyperlight_work / "initrd.cpio"
+        is_pyhl = workload in HYPERLIGHT_PYHL_WORKLOADS
+        hl_heap = memory["hyperlight"]
+
+        if not hl_kernel.is_file() or not hl_initrd.is_file():
+            extract_docker_artifact(hl_image, "/kernel", hl_kernel)
+            extract_docker_artifact(hl_image, "/initrd.cpio", hl_initrd)
+
+        # Snapshot validity check
         snapshot_config_path = snapshot / "benchmark-config.json"
         expected_snapshot_config: dict[str, object] = {
             "format": HYPERLIGHT_SNAPSHOT_FORMAT,
-            "kernel_sha256": sha256(kernel),
-            "initrd_sha256": sha256(initrd),
-            "driver_image_tag": HYPERLIGHT_DRIVER_TAG,
-            "warmup": GENERIC_SNAPSHOT_WARMUP,
+            "image": hl_image,
+            "kernel_sha256": sha256(hl_kernel),
+            "initrd_sha256": sha256(hl_initrd),
+            "pyhl": is_pyhl,
+            "heap_mib": hl_heap,
             "workload_in_snapshot": False,
         }
         snapshot_config: object = None
@@ -926,12 +940,18 @@ def prepare(
         if not snapshot_matches_image:
             if (output_dir / "raw.csv").is_file():
                 raise RuntimeError(
-                    "Hyperlight snapshot does not match the current generic CPython "
-                    f"image in {output_dir}; choose a new --output directory"
+                    "Hyperlight snapshot does not match the current workload image "
+                    f"in {output_dir}; choose a new --output directory"
                 )
             shutil.rmtree(snapshot, ignore_errors=True)
+            capture_cmd: list[str | Path] = [
+                runner, "capture", hl_kernel, hl_initrd, snapshot,
+                "--heap-size", f"{hl_heap}Mi",
+            ]
+            if is_pyhl:
+                capture_cmd.append("--warmup")
             run_control(
-                [runner, "capture", kernel, initrd, snapshot],
+                capture_cmd,
                 cwd=HYPERLIGHT_RUNNER_DIR,
                 timeout=timeout,
                 marker="SNAPSHOT_OK",
@@ -942,11 +962,21 @@ def prepare(
             )
         require_file(snapshot / "index.json")
 
+        # In MXC's deployment model the snapshot is configured at install
+        # time, so Hyperlight always boots from a pre-warmed persisted
+        # snapshot.  Both "cold" and "restore" map to the same operation
+        # (loading that snapshot from disk) — there is no raw kernel boot.
+        if is_pyhl:
+            assert sample is not None
+            cold_args = ("cold", str(hl_initrd), str(snapshot), str(sample))
+        else:
+            cold_args = ("cold", str(hl_initrd), str(snapshot))
+
         specs[("hyperlight", "cold")] = CommandSpec(
             "hyperlight",
             "cold",
             runner,
-            ("cold", str(kernel), str(initrd), str(sample)),
+            cold_args,
             HYPERLIGHT_RUNNER_DIR,
             "BENCHMARK_OK",
         )
@@ -954,7 +984,7 @@ def prepare(
             "hyperlight",
             "restore",
             runner,
-            ("restore", str(initrd), str(snapshot), str(sample)),
+            cold_args,
             HYPERLIGHT_RUNNER_DIR,
             "BENCHMARK_OK",
         )
@@ -984,11 +1014,14 @@ def prepare(
         for key in commands
         if key.partition("/")[0] in VMM_ORDER
     }
-    delivery = {
+    delivery: dict[str, dict[str, str]] = {
         "nvx": {"method": "host_mount", "guest_path": "app.py"},
         "nanvix": {"method": "host_mount", "guest_path": "/mnt/hello.py"},
-        "hyperlight": {"method": "function_call", "function": "run"},
     }
+    if workload in HYPERLIGHT_PYHL_WORKLOADS:
+        delivery["hyperlight"] = {"method": "function_call", "function": "run"}
+    else:
+        delivery["hyperlight"] = {"method": "embedded_in_initrd"}
     build_patches = {}
     if "nvx" in manifest_vmms:
         build_patches["nvx"] = {
@@ -1000,23 +1033,37 @@ def prepare(
             "path": str(NANVIX_BUILD_PATCH.relative_to(SCRIPT_DIR)),
             "sha256": sha256(NANVIX_BUILD_PATCH),
         }
-    capture_points = {
-        "nvx": (
+    capture_points: dict[str, str] = {}
+    if "nvx" in manifest_vmms:
+        capture_points["nvx"] = (
             "initialized_cpython_with_numpy_pandas_pypandoc_before_host_mount"
             if workload == "pandoc-docx"
             else "initialized_untrained_cpython_before_host_mount"
-        ),
-        "nanvix": "initialized_cpython_and_ramfs_before_host_mount",
-        "hyperlight": "initialized_cpython_driver",
-    }
+        )
+    if "nanvix" in manifest_vmms:
+        capture_points["nanvix"] = "initialized_cpython_and_ramfs_before_host_mount"
+    if "hyperlight" in manifest_vmms:
+        capture_points["hyperlight"] = (
+            "initialized_cpython_driver"
+            if workload in HYPERLIGHT_PYHL_WORKLOADS
+            else "initialized_unikraft_elfloader"
+        )
+    sample_record: dict[str, object] = {}
+    if sample is not None and workload_sample_source is not None:
+        sample_record = {
+            "source": str(workload_sample_source.relative_to(SCRIPT_DIR)),
+            "sha256": sha256(sample),
+            "delivery": {vmm: delivery[vmm] for vmm in manifest_vmms},
+        }
+    else:
+        sample_record = {
+            "source": "embedded_in_initrd",
+            "delivery": {vmm: delivery.get(vmm, {"method": "embedded"}) for vmm in manifest_vmms},
+        }
     manifest = {
         "created_at_utc": previous_manifest.get("created_at_utc", utc_now()),
         "updated_at_utc": utc_now(),
-        "sample": {
-            "source": str(WORKLOAD_SAMPLES[workload].relative_to(SCRIPT_DIR)),
-            "sha256": sha256(sample),
-            "delivery": {vmm: delivery[vmm] for vmm in manifest_vmms},
-        },
+        "sample": sample_record,
         "workload": {
             "id": workload,
             "label": WORKLOAD_LABELS[workload],
@@ -1042,13 +1089,10 @@ def prepare(
             ),
             "workload_in_snapshot": False,
             "build_patches": build_patches,
-            "hyperlight_driver_images": (
-                {
-                    "kernel": HYPERLIGHT_DRIVER_KERNEL_IMAGE,
-                    "initrd": HYPERLIGHT_DRIVER_INITRD_IMAGE,
-                }
+            "hyperlight_workload_image": (
+                HYPERLIGHT_WORKLOAD_IMAGE.get(workload, "")
                 if "hyperlight" in manifest_vmms
-                else {}
+                else ""
             ),
             "capture_points": {
                 vmm: capture_points[vmm]
@@ -1143,7 +1187,8 @@ def write_metadata(
                     )
                     if memory.is_file():
                         artifact_paths.add(memory)
-    source_artifact_paths = {WORKLOAD_SAMPLES[workload]}
+    workload_sample = WORKLOAD_SAMPLES[workload]
+    source_artifact_paths: set[Path] = {workload_sample} if workload_sample is not None else set()
     if "nvx" in included_vmms:
         source_artifact_paths.update(
             {
@@ -1153,15 +1198,11 @@ def write_metadata(
             }
         )
     if "hyperlight" in included_vmms:
-        source_artifact_paths.update(
-            {
-                HYPERLIGHT_RUNNER_DIR
-                / "target"
-                / "release"
-                / "vmm-hyperlight-runner.exe",
-                HYPERLIGHT_DRIVER_KERNEL,
-                HYPERLIGHT_DRIVER_INITRD,
-            }
+        source_artifact_paths.add(
+            HYPERLIGHT_RUNNER_DIR
+            / "target"
+            / "release"
+            / "vmm-hyperlight-runner.exe"
         )
     artifact_paths.update(path for path in source_artifact_paths if path.is_file())
     metadata_path = output_dir / "metadata.json"
@@ -2146,8 +2187,9 @@ def write_report(
     )
     if "hyperlight" in included_vmms:
         cold_description += (
-            " Hyperlight's build/evolve API still captures and rewinds an in-memory "
-            "post-evolve snapshot before its first call."
+            " In MXC's deployment model the snapshot is configured at install "
+            "time, so Hyperlight always boots from a pre-warmed persisted "
+            "snapshot — cold and restore are the same operation."
         )
     mode_descriptions = {
         "cold": cold_description,
