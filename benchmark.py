@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark Python hello-world cold starts and persisted snapshot resumes."""
+"""Benchmark Python workloads across cold starts and persisted snapshot resumes."""
 
 from __future__ import annotations
 
@@ -39,6 +39,14 @@ PATCHES_DIR = SCRIPT_DIR / "patches"
 BUILD_RECEIPTS_DIR = SCRIPT_DIR / ".build-receipts"
 SAMPLES_DIR = SCRIPT_DIR / "samples"
 HELLO_SAMPLE = SAMPLES_DIR / "hello.py"
+PANDOC_DOCX_SAMPLE = SAMPLES_DIR / "pandoc_docx.py"
+NVX_PYTHON_INITRD = NVX_DIR / "build" / "initramfs-python.cpio.gz"
+PYPANDOC_VERSION = "1.17"
+PYPANDOC_WHEEL = f"pypandoc-{PYPANDOC_VERSION}-py3-none-any.whl"
+NVX_PYPANDOC_WHEEL = NVX_DIR / "alpine" / PYPANDOC_WHEEL
+PYPANDOC_WHEEL_SHA256 = (
+    "01fdbffa61edb9f8e82e8faad6954efcb7b6f8f0634aead4d89e322a00225a67"
+)
 NVX_BUILD_PATCH = PATCHES_DIR / "nvx-generic-snapshot-warmup.patch"
 NANVIX_BUILD_PATCH = PATCHES_DIR / "nanvix-generic-snapshot-warmup.patch"
 HYPERLIGHT_DRIVER_TAG = "v0.12.1"
@@ -71,19 +79,37 @@ VMM_PLOT_COLORS = {
     "nanvix": "#16a34a",
     "hyperlight": "#dc2626",
 }
+WORKLOAD_ORDER = ("hello", "pandoc-docx")
 WORKLOAD_LABELS = {
-    "nvx": "Python hello.py",
-    "nanvix": "Python hello.py",
-    "hyperlight": "Python hello.py",
+    "hello": "Python hello.py",
+    "pandoc-docx": "Python + pypandoc Markdown to DOCX",
 }
-PLOT_WORKLOAD_ORDER = ("python",)
-PLOT_WORKLOAD_LABELS = {"python": "Python"}
-PLOT_WORKLOAD_VMMS = {"python": VMM_ORDER}
+WORKLOAD_TITLES = {
+    "hello": "Python Hello-World",
+    "pandoc-docx": "Python pypandoc Markdown-to-DOCX",
+}
+WORKLOAD_VMMS: dict[str, tuple[str, ...]] = {
+    "hello": VMM_ORDER,
+    "pandoc-docx": ("nvx",),
+}
+WORKLOAD_SAMPLES = {
+    "hello": HELLO_SAMPLE,
+    "pandoc-docx": PANDOC_DOCX_SAMPLE,
+}
+WORKLOAD_MARKERS = {
+    "hello": "hello world",
+    "pandoc-docx": "PANDOC_DOCX_OK",
+}
 RSS_VMM_ORDER = ("nanvix", "nvx", "hyperlight")
 GUEST_MEMORY_MIB = {
-    "nvx": 512,
-    "nanvix": 256,
-    "hyperlight": 2560,
+    "hello": {
+        "nvx": 1024,
+        "nanvix": 256,
+        "hyperlight": 2560,
+    },
+    "pandoc-docx": {
+        "nvx": 1024,
+    },
 }
 MODE_ORDER = ("cold", "restore")
 MODE_LABELS = {"cold": "Cold Start", "restore": "Persisted Snapshot Resume"}
@@ -103,10 +129,17 @@ PHASE_LABELS = {
     "guest_call_ms": "First guest invocation",
     "lifecycle_overhead_ms": "Remaining process lifecycle",
 }
-NVX_CMDLINE = (
+NVX_BASE_CMDLINE = (
     "earlycon=xe9 console=hvc0 quiet loglevel=0 reboot=t panic=-1 "
     "nvx_mode=hostfs nvx_snapshot=1 pyapp=app.py"
 )
+NVX_WARMUP_IMPORTS = ("numpy", "pandas", "pypandoc")
+
+
+def nvx_cmdline(workload: str) -> str:
+    if workload == "pandoc-docx":
+        return f"{NVX_BASE_CMDLINE} nvx_python_warmup=1"
+    return NVX_BASE_CMDLINE
 
 
 class ProcessMemoryCounters(ctypes.Structure):
@@ -162,6 +195,15 @@ def utc_now() -> str:
 
 def command_text(command: Sequence[str]) -> str:
     return subprocess.list2cmdline([str(item) for item in command])
+
+
+def manifest_workload(manifest: dict[str, object]) -> str:
+    workload_record = manifest.get("workload")
+    if isinstance(workload_record, dict):
+        workload_id = cast(dict[str, object], workload_record).get("id")
+        if isinstance(workload_id, str) and workload_id in WORKLOAD_ORDER:
+            return workload_id
+    return "hello"
 
 
 def run_checked(
@@ -237,7 +279,13 @@ def require_build_receipt(
 
 
 def git_apply_check(repository: Path, patch: Path, *, reverse: bool = False) -> subprocess.CompletedProcess[str]:
-    command = ["git", "apply", "--ignore-space-change", "--check"]
+    command = [
+        "git",
+        "apply",
+        "--ignore-space-change",
+        "--unidiff-zero",
+        "--check",
+    ]
     if reverse:
         command.append("--reverse")
     command.append(str(patch))
@@ -261,7 +309,7 @@ def temporary_submodule_patch(
     forward = git_apply_check(repository, patch)
     if forward.returncode == 0:
         run_checked(
-            ["git", "apply", "--ignore-space-change", patch],
+            ["git", "apply", "--ignore-space-change", "--unidiff-zero", patch],
             cwd=repository,
         )
         applied_here = True
@@ -278,7 +326,14 @@ def temporary_submodule_patch(
     finally:
         if applied_here:
             run_checked(
-                ["git", "apply", "--ignore-space-change", "--reverse", patch],
+                [
+                    "git",
+                    "apply",
+                    "--ignore-space-change",
+                    "--unidiff-zero",
+                    "--reverse",
+                    patch,
+                ],
                 cwd=repository,
             )
 
@@ -313,8 +368,8 @@ def extract_docker_artifact(image: str, source: str, destination: Path) -> None:
     require_file(destination)
 
 
-def stage_sample(output_dir: Path, artifacts: Path) -> Path:
-    source = require_file(HELLO_SAMPLE)
+def stage_sample(output_dir: Path, artifacts: Path, source: Path) -> Path:
+    source = require_file(source)
     staged = artifacts / "samples" / source.name
     source_bytes = source.read_bytes()
     staged_exists = staged.is_file()
@@ -330,6 +385,53 @@ def stage_sample(output_dir: Path, artifacts: Path) -> Path:
     return staged
 
 
+def verify_pypandoc_wheel(wheel: Path) -> None:
+    wheel_sha256 = sha256(require_file(wheel))
+    if wheel_sha256 != PYPANDOC_WHEEL_SHA256:
+        raise RuntimeError(f"unexpected SHA-256 for {PYPANDOC_WHEEL}: {wheel_sha256}")
+
+
+@contextmanager
+def temporary_pypandoc_wheel() -> Generator[None, None, None]:
+    if NVX_PYPANDOC_WHEEL.is_file():
+        verify_pypandoc_wheel(NVX_PYPANDOC_WHEEL)
+        yield
+        return
+    with tempfile.TemporaryDirectory(prefix="vmm-benchmark-pypandoc-") as wheel_dir_name:
+        wheel_dir = Path(wheel_dir_name)
+        run_checked(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "download",
+                "--no-cache-dir",
+                "--no-deps",
+                "--only-binary=:all:",
+                "--dest",
+                wheel_dir,
+                f"pypandoc=={PYPANDOC_VERSION}",
+            ],
+            cwd=SCRIPT_DIR,
+        )
+        wheel = require_file(wheel_dir / PYPANDOC_WHEEL)
+        verify_pypandoc_wheel(wheel)
+        shutil.copyfile(wheel, NVX_PYPANDOC_WHEEL)
+        try:
+            yield
+        finally:
+            NVX_PYPANDOC_WHEEL.unlink(missing_ok=True)
+
+
+def nvx_build_provenance() -> dict[str, str]:
+    return {
+        "build_patch_sha256": sha256(NVX_BUILD_PATCH),
+        "pandoc_version": "3.10",
+        "pypandoc_version": PYPANDOC_VERSION,
+        "pypandoc_wheel_sha256": PYPANDOC_WHEEL_SHA256,
+    }
+
+
 def build_projects(selected: set[str]) -> None:
     require_command("docker")
     if selected.intersection({"nvx", "hyperlight"}):
@@ -337,7 +439,10 @@ def build_projects(selected: set[str]) -> None:
 
     if "nvx" in selected:
         (BUILD_RECEIPTS_DIR / "nvx.json").unlink(missing_ok=True)
-        with temporary_submodule_patch(NVX_DIR, NVX_BUILD_PATCH):
+        (BUILD_RECEIPTS_DIR / "nvx-pandoc-docx.json").unlink(missing_ok=True)
+        with temporary_submodule_patch(
+            NVX_DIR, NVX_BUILD_PATCH
+        ), temporary_pypandoc_wheel():
             run_checked(
                 [
                     sys.executable,
@@ -362,8 +467,12 @@ def build_projects(selected: set[str]) -> None:
             run_checked(["cargo", "build", "--release"], cwd=NVX_DIR)
             write_build_receipt(
                 "nvx",
-                {"build_patch_sha256": sha256(NVX_BUILD_PATCH)},
-                {"python_initrd": NVX_DIR / "build" / "initramfs-python.cpio.gz"},
+                nvx_build_provenance(),
+                {
+                    "vmm": NVX_DIR / "target" / "release" / "microvm.exe",
+                    "kernel": NVX_DIR / "build" / "vmlinux",
+                    "python_initrd": NVX_PYTHON_INITRD,
+                },
             )
 
     if "nanvix" in selected:
@@ -513,10 +622,31 @@ def prepare(
     output_dir: Path,
     selected: set[str],
     timeout: float,
+    workload: str,
 ) -> dict[tuple[str, str], CommandSpec]:
     artifacts = output_dir / "artifacts"
     artifacts.mkdir(parents=True, exist_ok=True)
-    sample = stage_sample(output_dir, artifacts)
+    manifest_path = output_dir / "manifest.json"
+    previous_manifest: dict[str, object] = {}
+    if manifest_path.is_file():
+        loaded_manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(loaded_manifest, dict):
+            previous_manifest = cast(dict[str, object], loaded_manifest)
+            previous_workload = manifest_workload(previous_manifest)
+            if previous_workload != workload:
+                raise RuntimeError(
+                    f"existing results in {output_dir} use workload "
+                    f"{previous_workload!r}, not {workload!r}; choose a new "
+                    "--output directory"
+                )
+    sample = stage_sample(output_dir, artifacts, WORKLOAD_SAMPLES[workload])
+    memory = GUEST_MEMORY_MIB[workload]
+    marker = WORKLOAD_MARKERS[workload]
+    warmup_imports = (
+        list(NVX_WARMUP_IMPORTS)
+        if "nvx" in selected and workload == "pandoc-docx"
+        else []
+    )
     specs: dict[tuple[str, str], CommandSpec] = {}
 
     if "nvx" in selected:
@@ -529,20 +659,31 @@ def prepare(
 
         executable = require_file(NVX_DIR / "target" / "release" / "microvm.exe")
         kernel = require_file(NVX_DIR / "build" / "vmlinux")
-        initrd = require_file(NVX_DIR / "build" / "initramfs-python.cpio.gz")
+        initrd = require_file(NVX_PYTHON_INITRD)
         require_build_receipt(
             "nvx",
-            {"build_patch_sha256": sha256(NVX_BUILD_PATCH)},
-            {"python_initrd": initrd},
+            nvx_build_provenance(),
+            {
+                "vmm": executable,
+                "kernel": kernel,
+                "python_initrd": initrd,
+            },
         )
+        cmdline = nvx_cmdline(workload)
         nvx_snapshot_config_path = nvx_snapshot / "benchmark-config.json"
         expected_nvx_snapshot_config: dict[str, object] = {
             "format": 1,
+            "vmm_sha256": sha256(executable),
             "kernel_sha256": sha256(kernel),
             "initrd_sha256": sha256(initrd),
+            "guest_memory_mib": memory["nvx"],
             "build_patch_sha256": sha256(NVX_BUILD_PATCH),
-            "cmdline": NVX_CMDLINE,
-            "warmup": GENERIC_SNAPSHOT_WARMUP,
+            "workload": workload,
+            "cmdline": cmdline,
+            "warmup": {
+                "statement": GENERIC_SNAPSHOT_WARMUP,
+                "imports": warmup_imports,
+            },
             "workload_in_snapshot": False,
         }
         nvx_snapshot_config: object = None
@@ -571,9 +712,9 @@ def prepare(
                     "--initrd",
                     initrd,
                     "--mem",
-                    "512",
+                    str(memory["nvx"]),
                     "--cmdline",
-                    NVX_CMDLINE,
+                    cmdline,
                     "--mount",
                     nvx_mount,
                     "--snapshot",
@@ -600,15 +741,15 @@ def prepare(
                 "--initrd",
                 str(initrd),
                 "--mem",
-                "512",
+                str(memory["nvx"]),
                 "--cmdline",
-                NVX_CMDLINE,
+                cmdline,
                 "--mount",
                 str(nvx_mount),
                 "--exit-on-boot",
                 "--quiet",
                 "--boot-marker",
-                "hello world",
+                marker,
             ),
             NVX_DIR,
             "to marker",
@@ -621,13 +762,13 @@ def prepare(
                 "--restore",
                 str(nvx_snapshot),
                 "--mem",
-                "512",
+                str(memory["nvx"]),
                 "--mount",
                 str(nvx_mount),
                 "--exit-on-boot",
                 "--quiet",
                 "--boot-marker",
-                "hello world",
+                marker,
             ),
             NVX_DIR,
             "to marker",
@@ -818,12 +959,6 @@ def prepare(
             "BENCHMARK_OK",
         )
 
-    manifest_path = output_dir / "manifest.json"
-    previous_manifest: dict[str, object] = {}
-    if manifest_path.is_file():
-        loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if isinstance(loaded_manifest, dict):
-            previous_manifest = loaded_manifest
     previous_commands = previous_manifest.get("commands", {})
     commands = (
         {
@@ -844,46 +979,87 @@ def prepare(
             for (vmm, mode), spec in specs.items()
         }
     )
+    manifest_vmms = {
+        key.partition("/")[0]
+        for key in commands
+        if key.partition("/")[0] in VMM_ORDER
+    }
+    delivery = {
+        "nvx": {"method": "host_mount", "guest_path": "app.py"},
+        "nanvix": {"method": "host_mount", "guest_path": "/mnt/hello.py"},
+        "hyperlight": {"method": "function_call", "function": "run"},
+    }
+    build_patches = {}
+    if "nvx" in manifest_vmms:
+        build_patches["nvx"] = {
+            "path": str(NVX_BUILD_PATCH.relative_to(SCRIPT_DIR)),
+            "sha256": sha256(NVX_BUILD_PATCH),
+        }
+    if "nanvix" in manifest_vmms:
+        build_patches["nanvix"] = {
+            "path": str(NANVIX_BUILD_PATCH.relative_to(SCRIPT_DIR)),
+            "sha256": sha256(NANVIX_BUILD_PATCH),
+        }
+    capture_points = {
+        "nvx": (
+            "initialized_cpython_with_numpy_pandas_pypandoc_before_host_mount"
+            if workload == "pandoc-docx"
+            else "initialized_untrained_cpython_before_host_mount"
+        ),
+        "nanvix": "initialized_cpython_and_ramfs_before_host_mount",
+        "hyperlight": "initialized_cpython_driver",
+    }
     manifest = {
         "created_at_utc": previous_manifest.get("created_at_utc", utc_now()),
         "updated_at_utc": utc_now(),
         "sample": {
-            "source": str(HELLO_SAMPLE.relative_to(SCRIPT_DIR)),
+            "source": str(WORKLOAD_SAMPLES[workload].relative_to(SCRIPT_DIR)),
             "sha256": sha256(sample),
-            "delivery": {
-                "nvx": {"method": "host_mount", "guest_path": "app.py"},
-                "nanvix": {
-                    "method": "host_mount",
-                    "guest_path": "/mnt/hello.py",
-                },
-                "hyperlight": {"method": "function_call", "function": "run"},
-            },
+            "delivery": {vmm: delivery[vmm] for vmm in manifest_vmms},
+        },
+        "workload": {
+            "id": workload,
+            "label": WORKLOAD_LABELS[workload],
+            "title": WORKLOAD_TITLES[workload],
+            "dependencies": (
+                {
+                    "pandoc": {"distribution": "Alpine 3.24", "version": "3.10"},
+                    "pypandoc": {
+                        "version": PYPANDOC_VERSION,
+                        "wheel_sha256": PYPANDOC_WHEEL_SHA256,
+                    },
+                }
+                if workload == "pandoc-docx"
+                else {}
+            ),
         },
         "snapshot_policy": {
             "generic_warmup": GENERIC_SNAPSHOT_WARMUP,
+            "nvx_import_warmup": (
+                list(NVX_WARMUP_IMPORTS)
+                if "nvx" in manifest_vmms and workload == "pandoc-docx"
+                else []
+            ),
             "workload_in_snapshot": False,
-            "build_patches": {
-                "nvx": {
-                    "path": str(NVX_BUILD_PATCH.relative_to(SCRIPT_DIR)),
-                    "sha256": sha256(NVX_BUILD_PATCH),
-                },
-                "nanvix": {
-                    "path": str(NANVIX_BUILD_PATCH.relative_to(SCRIPT_DIR)),
-                    "sha256": sha256(NANVIX_BUILD_PATCH),
-                },
-            },
-            "hyperlight_driver_images": {
-                "kernel": HYPERLIGHT_DRIVER_KERNEL_IMAGE,
-                "initrd": HYPERLIGHT_DRIVER_INITRD_IMAGE,
-            },
+            "build_patches": build_patches,
+            "hyperlight_driver_images": (
+                {
+                    "kernel": HYPERLIGHT_DRIVER_KERNEL_IMAGE,
+                    "initrd": HYPERLIGHT_DRIVER_INITRD_IMAGE,
+                }
+                if "hyperlight" in manifest_vmms
+                else {}
+            ),
             "capture_points": {
-                "nvx": "initialized_untrained_cpython_before_host_mount",
-                "nanvix": "initialized_cpython_and_ramfs_before_host_mount",
-                "hyperlight": "initialized_cpython_driver",
+                vmm: capture_points[vmm]
+                for vmm in manifest_vmms
             },
         },
-        "guest_memory_mib": GUEST_MEMORY_MIB,
-        "workloads": WORKLOAD_LABELS,
+        "guest_memory_mib": memory,
+        "workloads": {
+            vmm: WORKLOAD_LABELS[workload]
+            for vmm in manifest_vmms
+        },
         "commands": commands,
     }
     manifest_path.write_text(
@@ -937,7 +1113,24 @@ def version_output(command: Sequence[str]) -> str:
         return "unavailable"
 
 
-def write_metadata(output_dir: Path, specs: dict[tuple[str, str], CommandSpec]) -> None:
+def write_metadata(
+    output_dir: Path,
+    specs: dict[tuple[str, str], CommandSpec],
+    workload: str,
+) -> None:
+    included_vmms = {spec.vmm for spec in specs.values()}
+    manifest_path = output_dir / "manifest.json"
+    if manifest_path.is_file():
+        loaded_manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(loaded_manifest, dict):
+            manifest = cast(dict[str, object], loaded_manifest)
+            manifest_commands = manifest.get("commands")
+            if isinstance(manifest_commands, dict):
+                included_vmms.update(
+                    key.partition("/")[0]
+                    for key in manifest_commands
+                    if isinstance(key, str) and key.partition("/")[0] in VMM_ORDER
+                )
     artifact_paths = {spec.executable for spec in specs.values()}
     for spec in specs.values():
         for argument in spec.arguments:
@@ -950,15 +1143,26 @@ def write_metadata(output_dir: Path, specs: dict[tuple[str, str], CommandSpec]) 
                     )
                     if memory.is_file():
                         artifact_paths.add(memory)
-    source_artifact_paths = {
-        NVX_DIR / "target" / "release" / "microvm.exe",
-        NVX_DIR / "build" / "vmlinux",
-        NVX_DIR / "build" / "initramfs-python.cpio.gz",
-        HYPERLIGHT_RUNNER_DIR / "target" / "release" / "vmm-hyperlight-runner.exe",
-        HYPERLIGHT_DRIVER_KERNEL,
-        HYPERLIGHT_DRIVER_INITRD,
-        HELLO_SAMPLE,
-    }
+    source_artifact_paths = {WORKLOAD_SAMPLES[workload]}
+    if "nvx" in included_vmms:
+        source_artifact_paths.update(
+            {
+                NVX_DIR / "target" / "release" / "microvm.exe",
+                NVX_DIR / "build" / "vmlinux",
+                NVX_PYTHON_INITRD,
+            }
+        )
+    if "hyperlight" in included_vmms:
+        source_artifact_paths.update(
+            {
+                HYPERLIGHT_RUNNER_DIR
+                / "target"
+                / "release"
+                / "vmm-hyperlight-runner.exe",
+                HYPERLIGHT_DRIVER_KERNEL,
+                HYPERLIGHT_DRIVER_INITRD,
+            }
+        )
     artifact_paths.update(path for path in source_artifact_paths if path.is_file())
     metadata_path = output_dir / "metadata.json"
     previous_metadata: dict[str, object] = {}
@@ -1020,7 +1224,10 @@ def write_metadata(output_dir: Path, specs: dict[tuple[str, str], CommandSpec]) 
         "artifacts": [
             artifacts_by_path[path] for path in sorted(artifacts_by_path)
         ],
-        "workloads": WORKLOAD_LABELS,
+        "workload": {
+            "id": workload,
+            "label": WORKLOAD_LABELS[workload],
+        },
         "measurement": {
             "elapsed": "perf_counter_ns around direct VMM process creation through exit",
             "peak_rss": "Windows GetProcessMemoryInfo PeakWorkingSetSize after process exit",
@@ -1677,13 +1884,20 @@ def render_svg_as_png(svg_path: Path) -> Path:
 
 def analyze(output_dir: Path, expected_samples: int | None = None) -> list[dict[str, object]]:
     raw_path = require_file(output_dir / "raw.csv")
+    manifest = cast(
+        dict[str, object],
+        json.loads((output_dir / "manifest.json").read_text(encoding="utf-8")),
+    )
+    workload = manifest_workload(manifest)
+    workload_label = WORKLOAD_LABELS[workload]
+    workload_title = WORKLOAD_TITLES[workload]
+    workload_vmms = WORKLOAD_VMMS[workload]
     groups = load_groups(raw_path)
     if not groups:
         raise RuntimeError(f"no benchmark records in {raw_path}")
     current_plot_stems = {
         f"{kind}_{workload}_{mode}"
         for kind in ("cdf_execution_time", "barplot_peak_rss")
-        for workload in PLOT_WORKLOAD_ORDER
         for mode in MODE_ORDER
     }
     for pattern in ("cdf_execution_time_*.*", "barplot_peak_rss_*.*"):
@@ -1706,7 +1920,7 @@ def analyze(output_dir: Path, expected_samples: int | None = None) -> list[dict[
             summaries.append(
                 {
                     "vmm": vmm,
-                    "workload": WORKLOAD_LABELS[vmm],
+                    "workload": workload_label,
                     "mode": mode,
                     "execution_time_ms": elapsed,
                     "peak_rss_mib": rss,
@@ -1817,40 +2031,29 @@ def analyze(output_dir: Path, expected_samples: int | None = None) -> list[dict[
                 }
             )
 
-    for workload in PLOT_WORKLOAD_ORDER:
-        workload_label = PLOT_WORKLOAD_LABELS[workload]
-        vmms = PLOT_WORKLOAD_VMMS[workload]
-        for mode in MODE_ORDER:
-            if not any((vmm, mode) in groups for vmm in vmms):
-                continue
-            execution_plot = (
-                output_dir / f"cdf_execution_time_{workload}_{mode}.svg"
-            )
-            write_cdf_svg(
-                execution_plot,
-                groups,
-                vmms=vmms,
-                metric="elapsed_ms",
-                mode=mode,
-                unit="Execution Time (ms)",
-                title=(
-                    f"{workload_label} Hello-World {MODE_LABELS[mode]} "
-                    "Execution Time CDF"
-                ),
-            )
-            render_svg_as_png(execution_plot)
-            rss_plot = output_dir / f"barplot_peak_rss_{workload}_{mode}.svg"
-            write_rss_barplot_svg(
-                rss_plot,
-                groups,
-                vmms=tuple(vmm for vmm in RSS_VMM_ORDER if vmm in vmms),
-                mode=mode,
-                title=(
-                    f"{workload_label} Hello-World {MODE_LABELS[mode]} "
-                    "P99 Peak Resident Memory"
-                ),
-            )
-            render_svg_as_png(rss_plot)
+    for mode in MODE_ORDER:
+        if not any((vmm, mode) in groups for vmm in workload_vmms):
+            continue
+        execution_plot = output_dir / f"cdf_execution_time_{workload}_{mode}.svg"
+        write_cdf_svg(
+            execution_plot,
+            groups,
+            vmms=workload_vmms,
+            metric="elapsed_ms",
+            mode=mode,
+            unit="Execution Time (ms)",
+            title=f"{workload_title} {MODE_LABELS[mode]} Execution Time CDF",
+        )
+        render_svg_as_png(execution_plot)
+        rss_plot = output_dir / f"barplot_peak_rss_{workload}_{mode}.svg"
+        write_rss_barplot_svg(
+            rss_plot,
+            groups,
+            vmms=tuple(vmm for vmm in RSS_VMM_ORDER if vmm in workload_vmms),
+            mode=mode,
+            title=f"{workload_title} {MODE_LABELS[mode]} P99 Peak Resident Memory",
+        )
+        render_svg_as_png(rss_plot)
 
     for mode in MODE_ORDER:
         for stem in (
@@ -1871,9 +2074,14 @@ def write_report(
     summaries: Sequence[dict[str, object]],
     phase_summaries: Sequence[dict[str, object]],
 ) -> None:
-    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest = cast(
+        dict[str, object],
+        json.loads((output_dir / "manifest.json").read_text(encoding="utf-8")),
+    )
     metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
     memory = manifest["guest_memory_mib"]
+    workload = manifest_workload(manifest)
+    workload_title = WORKLOAD_TITLES[workload]
     included_vmms = {
         str(summary["vmm"])
         for summary in summaries
@@ -1890,10 +2098,20 @@ def write_report(
             snapshot_policy.get("generic_warmup") == GENERIC_SNAPSHOT_WARMUP
             and snapshot_policy.get("workload_in_snapshot") is False
         )
-    if generic_snapshot_policy:
+    if snapshot_policy is not None and generic_snapshot_policy:
         snapshot_method_lines = [
             "- Every snapshot executes the generic Python statement `pass` before capture.",
         ]
+        nvx_import_warmup = snapshot_policy.get("nvx_import_warmup")
+        if "nvx" in included_vmms and isinstance(nvx_import_warmup, list):
+            warmup_names = cast(list[object], nvx_import_warmup)
+            imports = ", ".join(
+                name for name in warmup_names if isinstance(name, str)
+            )
+            if imports:
+                snapshot_method_lines.append(
+                    f"- NVX warm-imports {imports} before the persisted snapshot is captured."
+                )
         if "hyperlight" in included_vmms:
             snapshot_method_lines.append(
                 "- Hyperlight snapshots an initialized CPython driver, then passes the sample "
@@ -1914,7 +2132,7 @@ def write_report(
         (str(summary["vmm"]), str(summary["mode"])): summary for summary in summaries
     }
     lines = [
-        "# VMM hello-world benchmark",
+        f"# VMM {workload_title} benchmark",
         "",
         "End-to-end process lifecycle and runner-internal phases are reported separately. "
         "Every end-to-end sample starts a new host process. Host filesystem caches were "
@@ -1995,7 +2213,7 @@ def write_report(
         time_reduction = 100.0 * (1.0 - restore_time["p50"] / cold_time["p50"])
         rss_reduction = 100.0 * (1.0 - restore_rss["p50"] / cold_rss["p50"])
         lines.append(
-            f"| {VMM_LABELS[vmm]} | {WORKLOAD_LABELS[vmm]} | {speedup:.2f}x | "
+            f"| {VMM_LABELS[vmm]} | {cold['workload']} | {speedup:.2f}x | "
             f"{time_reduction:.1f}% | {rss_reduction:.1f}% |"
         )
     if phase_summaries:
@@ -2047,31 +2265,27 @@ def write_report(
                 "benchmark and is not inferred from persisted snapshot load time.",
             ]
         )
-    for workload in PLOT_WORKLOAD_ORDER:
-        vmms = PLOT_WORKLOAD_VMMS[workload]
-        available_modes = [
-            mode
-            for mode in MODE_ORDER
-            if any((vmm, mode) in summary_by_key for vmm in vmms)
-        ]
-        if not available_modes:
-            continue
-        workload_label = PLOT_WORKLOAD_LABELS[workload]
-        lines.extend(["", f"## {workload_label} plots"])
-        for mode in available_modes:
-            mode_label = MODE_LABELS[mode]
-            lines.extend(
-                [
-                    "",
-                    f"### {mode_label}",
-                    "",
-                    f"![{workload_label} {mode_label} execution-time CDF]"
-                    f"(cdf_execution_time_{workload}_{mode}.svg)",
-                    "",
-                    f"![{workload_label} {mode_label} P99 peak-RSS bar plot]"
-                    f"(barplot_peak_rss_{workload}_{mode}.svg)",
-                ]
-            )
+    available_modes = [
+        mode
+        for mode in MODE_ORDER
+        if any((vmm, mode) in summary_by_key for vmm in WORKLOAD_VMMS[workload])
+    ]
+    if available_modes:
+        lines.extend(["", f"## {workload_title} plots"])
+    for mode in available_modes:
+        mode_label = MODE_LABELS[mode]
+        lines.extend(
+            [
+                "",
+                f"### {mode_label}",
+                "",
+                f"![{workload_title} {mode_label} execution-time CDF]"
+                f"(cdf_execution_time_{workload}_{mode}.svg)",
+                "",
+                f"![{workload_title} {mode_label} P99 peak-RSS bar plot]"
+                f"(barplot_peak_rss_{workload}_{mode}.svg)",
+            ]
+        )
     lines.extend(["", "## Revisions", ""])
     for name, repository in metadata["repositories"].items():
         worktree = " with local changes" if repository["worktree_dirty"] else ""
@@ -2147,10 +2361,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cooldown-ms", type=int, default=100)
     parser.add_argument("--no-preflight", action="store_true")
     parser.add_argument(
+        "--workload",
+        choices=WORKLOAD_ORDER,
+        default="hello",
+        help="workload to run (default: hello)",
+    )
+    parser.add_argument(
         "--vmm",
         action="append",
         choices=VMM_ORDER,
-        help="limit to one or more VMM/workload targets; may be repeated",
+        help="limit to one or more VMM targets supported by the workload; may be repeated",
     )
     parser.add_argument(
         "--output",
@@ -2170,7 +2390,14 @@ def main() -> int:
         raise ValueError("--timeout must be positive")
     if args.cooldown_ms < 0:
         raise ValueError("--cooldown-ms cannot be negative")
-    selected = set(args.vmm or VMM_ORDER)
+    supported_vmms = set(WORKLOAD_VMMS[args.workload])
+    selected = set(args.vmm) if args.vmm else supported_vmms
+    unsupported_vmms = selected - supported_vmms
+    if unsupported_vmms:
+        unsupported = ", ".join(sorted(unsupported_vmms))
+        raise ValueError(
+            f"workload {args.workload!r} does not support VMM target(s): {unsupported}"
+        )
     output_dir = (
         args.output.resolve()
         if args.output
@@ -2191,8 +2418,9 @@ def main() -> int:
         output_dir,
         selected,
         args.timeout,
+        args.workload,
     )
-    write_metadata(output_dir, specs)
+    write_metadata(output_dir, specs, args.workload)
     if args.prepare_only:
         print(f"Prepared artifacts in {output_dir}")
         return 0

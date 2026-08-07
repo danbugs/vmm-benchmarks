@@ -1,12 +1,82 @@
 diff --git a/alpine/snapshot-trampoline.py b/alpine/snapshot-trampoline.py
-index f581e82..15a8daa 100644
+index f581e82..2493f20 100644
 --- a/alpine/snapshot-trampoline.py
 +++ b/alpine/snapshot-trampoline.py
-@@ -83,6 +83,7 @@ def main(argv: list[str]) -> None:
-     mount, warmup, app = parse_args(argv)
-     if warmup:
-         warm_interpreter()
+@@ -48,0 +49 @@ def warm_interpreter() -> None:
++    import pypandoc
+@@ -51,0 +53 @@ def warm_interpreter() -> None:
++    assert pypandoc.__version__ == "1.17"
+@@ -85,0 +88 @@ def main(argv: list[str]) -> None:
 +    exec(compile("pass", "<snapshot-warmup>", "exec"), {"__name__": "__main__"})
-     request_snapshot()
-     if mount is not None:
-         mount_hostfs(*mount)
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 08aa845..4eca5e2 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -61 +61 @@ RUN mkdir -p /out && python3 /repo/scripts/nvx.py build-initramfs
+-# ---- Python initramfs: Alpine rootfs + CPython + numpy/pandas + the snapshot apps. ----
++# ---- Python initramfs: Alpine rootfs + CPython + numpy/pandas/pypandoc + snapshot apps. ----
+diff --git a/scripts/nvx_tools/build.py b/scripts/nvx_tools/build.py
+index c43a497..2d6becc 100644
+--- a/scripts/nvx_tools/build.py
++++ b/scripts/nvx_tools/build.py
+@@ -4,0 +5 @@ from __future__ import annotations
++import hashlib
+@@ -7,0 +9 @@ import subprocess
++import zipfile
+@@ -66,0 +69 @@ class PythonInitramfsProfile:
++    wheels: tuple[tuple[str, str], ...]
+@@ -77 +80,7 @@ PYTHON_INITRAMFS_PROFILES = {
+-        packages=("python3", "py3-numpy", "py3-pandas"),
++        packages=("python3", "py3-numpy", "py3-pandas", "pandoc"),
++        wheels=(
++            (
++                "pypandoc-1.17-py3-none-any.whl",
++                "01fdbffa61edb9f8e82e8faad6954efcb7b6f8f0634aead4d89e322a00225a67",
++            ),
++        ),
+@@ -96,0 +106 @@ PYTHON_INITRAMFS_PROFILES = {
++        wheels=(),
+@@ -325,0 +336,24 @@ def _normalize_initramfs_metadata(root: Path) -> None:
++def _install_python_wheel(root: Path, name: str, expected_sha256: str) -> None:
++    wheel = REPO_ROOT / "alpine" / name
++    if not wheel.is_file():
++        raise ScriptError(f"required Python wheel does not exist: {wheel}")
++    actual_sha256 = hashlib.sha256(wheel.read_bytes()).hexdigest()
++    if actual_sha256 != expected_sha256:
++        raise ScriptError(
++            f"unexpected SHA-256 for {wheel}: {actual_sha256}"
++        )
++    site_packages = tuple((root / "usr" / "lib").glob("python3.*/site-packages"))
++    if len(site_packages) != 1:
++        raise ScriptError(
++            f"expected one Python site-packages directory, found {len(site_packages)}"
++        )
++    with zipfile.ZipFile(wheel) as archive:
++        if any(
++            Path(member.filename).is_absolute()
++            or ".." in Path(member.filename).parts
++            for member in archive.infolist()
++        ):
++            raise ScriptError(f"Python wheel contains an unsafe path: {wheel}")
++        archive.extractall(site_packages[0])
++
++
+@@ -407,0 +442,2 @@ def build_python_initramfs_native(
++    for wheel_name, wheel_sha256 in profile.wheels:
++        _install_python_wheel(root, wheel_name, wheel_sha256)
+diff --git a/scripts/tests/test_nvx_tools.py b/scripts/tests/test_nvx_tools.py
+index d608be5..462071e 100644
+--- a/scripts/tests/test_nvx_tools.py
++++ b/scripts/tests/test_nvx_tools.py
+@@ -1125 +1125,4 @@ class BuildTests(unittest.TestCase):
+-        self.assertTrue(PYTHON_INITRAMFS_PROFILES["full"].prune_runtime)
++        profile = PYTHON_INITRAMFS_PROFILES["full"]
++        self.assertTrue(profile.prune_runtime)
++        self.assertIn("pandoc", profile.packages)
++        self.assertEqual(profile.wheels[0][0], "pypandoc-1.17-py3-none-any.whl")
+@@ -1128 +1131 @@ class BuildTests(unittest.TestCase):
+-            PYTHON_INITRAMFS_PROFILES["full"].sources,
++            profile.sources,
+@@ -1150 +1153 @@ class BuildTests(unittest.TestCase):
+-        for dependency in ("numpy", "pandas"):
++        for dependency in ("numpy", "pandas", "pypandoc"):
