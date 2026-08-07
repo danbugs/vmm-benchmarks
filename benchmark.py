@@ -146,8 +146,12 @@ GUEST_MEMORY_MIB: dict[str, dict[str, int]] = {
         "hyperlight": 512,
     },
 }
-MODE_ORDER = ("cold", "restore")
-MODE_LABELS = {"cold": "Cold Start", "restore": "Persisted Snapshot Resume"}
+MODE_ORDER = ("cold", "restore", "warm")
+MODE_LABELS = {
+    "cold": "Cold Start",
+    "restore": "Persisted Snapshot Resume",
+    "warm": "Warm Reuse",
+}
 GENERIC_SNAPSHOT_WARMUP = "pass"
 HYPERLIGHT_SNAPSHOT_FORMAT = 2
 PHASE_FIELDS = (
@@ -155,6 +159,7 @@ PHASE_FIELDS = (
     "initial_rewind_ms",
     "snapshot_load_ms",
     "guest_call_ms",
+    "rewind_ms",
     "lifecycle_overhead_ms",
 )
 PHASE_LABELS = {
@@ -162,6 +167,7 @@ PHASE_LABELS = {
     "initial_rewind_ms": "Initial in-memory rewind",
     "snapshot_load_ms": "Persisted snapshot load + VM construction",
     "guest_call_ms": "First guest invocation",
+    "rewind_ms": "In-memory state rewind",
     "lifecycle_overhead_ms": "Remaining process lifecycle",
 }
 NVX_BASE_CMDLINE = (
@@ -989,6 +995,20 @@ def prepare(
             "BENCHMARK_OK",
         )
 
+        # Warm reuse — load snapshot once, call guest repeatedly with
+        # in-memory state rewind between calls.  Only pyhl workloads
+        # support warm reuse (they use call_named with a script).
+        if is_pyhl:
+            assert sample is not None
+            specs[("hyperlight", "warm")] = CommandSpec(
+                "hyperlight",
+                "warm",
+                runner,
+                ("warm", str(hl_initrd), str(snapshot), str(sample)),
+                HYPERLIGHT_RUNNER_DIR,
+                "BENCHMARK_OK",
+            )
+
     previous_commands = previous_manifest.get("commands", {})
     commands = (
         {
@@ -1411,6 +1431,130 @@ def run_samples(
             )
             if cooldown_ms:
                 time.sleep(cooldown_ms / 1000.0)
+
+
+def run_warm_benchmark(
+    output_dir: Path,
+    spec: CommandSpec,
+    *,
+    samples: int,
+    timeout: float,
+    preflight: bool,
+) -> None:
+    """Run a single warm-reuse process with N iterations and record each as a sample.
+
+    Unlike cold/restore (one process per sample), warm reuse loads the snapshot
+    once and invokes the guest repeatedly with in-memory state rewind.  Each
+    iteration's guest call time is recorded as elapsed_ms.
+    """
+    raw_path = output_dir / "raw.csv"
+    failures = output_dir / "failures"
+    failures.mkdir(parents=True, exist_ok=True)
+    completed = load_completed(raw_path)
+    warm_completed = {s for vmm, mode, s in completed if vmm == spec.vmm and mode == "warm"}
+    if len(warm_completed) >= samples:
+        return
+
+    if preflight and not warm_completed:
+        print("Running one unrecorded warm preflight iteration...", flush=True)
+        preflight_cmd = [*spec.command, "--iterations", "1"]
+        run_control(
+            preflight_cmd,
+            cwd=spec.cwd,
+            timeout=timeout,
+            marker="BENCHMARK_OK",
+        )
+
+    command = [*spec.command, "--iterations", str(samples)]
+    rendered = [str(item) for item in command]
+    print(f"+ ({spec.cwd}) {command_text(rendered)}", flush=True)
+    process = subprocess.Popen(
+        rendered,
+        cwd=spec.cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        output_bytes, _ = process.communicate(timeout=timeout * samples)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output_bytes, _ = process.communicate()
+        raise RuntimeError(
+            f"warm benchmark timed out after {timeout * samples:.1f}s\n"
+            f"{output_bytes.decode('utf-8', errors='replace')}"
+        )
+    peak_rss = peak_working_set(process)
+    output = output_bytes.decode("utf-8", errors="replace")
+
+    if process.returncode != 0 or spec.success_marker not in output:
+        failure_path = failures / "hyperlight-warm.log"
+        failure_path.write_text(
+            f"exit={process.returncode}\n{output}", encoding="utf-8"
+        )
+        raise RuntimeError(f"warm benchmark failed; details: {failure_path}")
+
+    # Parse per-iteration timings from BENCHMARK_PHASE lines
+    iterations: list[dict[str, float]] = []
+    for line in output.splitlines():
+        if not line.startswith("BENCHMARK_PHASE "):
+            continue
+        fields: dict[str, float] = {}
+        for field in line.removeprefix("BENCHMARK_PHASE ").split():
+            name, separator, value = field.partition("=")
+            if separator:
+                fields[name] = float(value)
+        if "warm_iteration" in fields:
+            iterations.append(fields)
+
+    if len(iterations) != samples:
+        raise RuntimeError(
+            f"expected {samples} warm iterations, got {len(iterations)}"
+        )
+
+    write_header = not raw_path.is_file()
+    sequence = len(completed)
+    with raw_path.open("a", newline="", encoding="utf-8") as destination:
+        writer = csv.DictWriter(destination, fieldnames=RAW_FIELDS)
+        if write_header:
+            writer.writeheader()
+            destination.flush()
+            os.fsync(destination.fileno())
+
+        for index, iter_data in enumerate(iterations):
+            guest_call_ms = iter_data.get("guest_call_ms", 0.0)
+            rewind_ms = iter_data.get("rewind_ms", 0.0)
+            # elapsed_ms = guest call time — the per-invocation cost
+            # rewind happens after the call to prepare for the next one
+            elapsed_ms = guest_call_ms
+
+            sequence += 1
+            row = {
+                "sequence": sequence,
+                "timestamp_utc": utc_now(),
+                "vmm": spec.vmm,
+                "mode": "warm",
+                "sample": index + 1,
+                "elapsed_ms": f"{elapsed_ms:.6f}",
+                "peak_rss_bytes": peak_rss,
+                "peak_rss_mib": f"{peak_rss / (1024 * 1024):.6f}",
+                "exit_code": process.returncode,
+                "guest_call_ms": f"{guest_call_ms:.6f}",
+                "rewind_ms": f"{rewind_ms:.6f}",
+                **{
+                    field: ""
+                    for field in PHASE_FIELDS
+                    if field not in ("guest_call_ms", "rewind_ms")
+                },
+            }
+            writer.writerow(row)
+            destination.flush()
+            os.fsync(destination.fileno())
+            print(
+                f"[warm {index + 1:03d}/{samples:03d}] {spec.vmm:10s} warm    "
+                f"call={guest_call_ms:9.3f} ms rewind={rewind_ms:9.3f} ms "
+                f"peak-rss={peak_rss / (1024 * 1024):8.2f} MiB",
+                flush=True,
+            )
 
 
 def percentile(values: Sequence[float], percent: float) -> float:
@@ -2197,6 +2341,12 @@ def write_report(
             "A fresh process loads one reusable persisted snapshot, invokes the workload, "
             "and exits."
         ),
+        "warm": (
+            "A single process loads one persisted snapshot, then invokes the workload "
+            "repeatedly with in-memory state rewind between calls.  Each iteration's "
+            "guest call time is recorded as a separate sample; the snapshot is loaded "
+            "only once and is not timed.  Warm reuse is Hyperlight-only."
+        ),
     }
     for mode in MODE_ORDER:
         available = [
@@ -2303,8 +2453,9 @@ def write_report(
                 "process lifecycle is the end-to-end duration minus emitted internal phases and "
                 "covers process startup, argument and script handling, output, and teardown.",
                 "",
-                "Steady-state in-memory rewind is not measured by this one-process-per-sample "
-                "benchmark and is not inferred from persisted snapshot load time.",
+                "Warm reuse measures steady-state in-memory rewind per iteration.  "
+                "Each warm sample is one guest call; the snapshot load happens once "
+                "at process start and is excluded from per-iteration timing.",
             ]
         )
     available_modes = [
@@ -2467,6 +2618,10 @@ def main() -> int:
         print(f"Prepared artifacts in {output_dir}")
         return 0
 
+    # Warm reuse runs all iterations in a single process, so pull
+    # it out of the per-process sampling loop.
+    warm_spec = specs.pop(("hyperlight", "warm"), None)
+
     run_samples(
         output_dir,
         specs,
@@ -2476,6 +2631,16 @@ def main() -> int:
         cooldown_ms=args.cooldown_ms,
         preflight=not args.no_preflight,
     )
+
+    if warm_spec is not None:
+        run_warm_benchmark(
+            output_dir,
+            warm_spec,
+            samples=args.samples,
+            timeout=args.timeout,
+            preflight=not args.no_preflight,
+        )
+
     summaries = analyze(output_dir, expected_samples=args.samples)
     print_summary(summaries)
     print(f"\nResults: {output_dir}", flush=True)
