@@ -10,6 +10,14 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const DEFAULT_HEAP_SIZE: u64 = 2560 * 1024 * 1024;
 
+struct SnapshotTimings {
+    sandbox_build_ms: f64,
+    initial_rewind_ms: f64,
+    warmup_ms: Option<f64>,
+    snapshot_capture_ms: f64,
+    snapshot_persist_ms: f64,
+}
+
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
@@ -31,6 +39,51 @@ fn parse_memory(s: &str) -> Result<u64> {
     }
 }
 
+fn create_snapshot(
+    kernel: &Path,
+    initrd: &Path,
+    snapshot: &Path,
+    heap_size: u64,
+    warmup: bool,
+    app_args: Vec<String>,
+) -> Result<SnapshotTimings> {
+    let build_started = Instant::now();
+    let mut sandbox = Sandbox::builder(kernel)
+        .initrd_file(initrd)
+        .heap_size(heap_size)
+        .args(app_args)
+        .build()?;
+    let sandbox_build_ms = build_started.elapsed().as_secs_f64() * 1000.0;
+
+    let rewind_started = Instant::now();
+    sandbox.restore()?;
+    let initial_rewind_ms = rewind_started.elapsed().as_secs_f64() * 1000.0;
+
+    let warmup_ms = if warmup {
+        let warmup_started = Instant::now();
+        let _: () = sandbox.call_named("run", "pass".to_string())?;
+        Some(warmup_started.elapsed().as_secs_f64() * 1000.0)
+    } else {
+        None
+    };
+
+    let capture_started = Instant::now();
+    sandbox.snapshot_now()?;
+    let snapshot_capture_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
+
+    let persist_started = Instant::now();
+    sandbox.save_snapshot(snapshot)?;
+    let snapshot_persist_ms = persist_started.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(SnapshotTimings {
+        sandbox_build_ms,
+        initial_rewind_ms,
+        warmup_ms,
+        snapshot_capture_ms,
+        snapshot_persist_ms,
+    })
+}
+
 // ── Prepare (untimed snapshot creation) ─────────────────────────────────
 
 fn capture(
@@ -41,31 +94,42 @@ fn capture(
     warmup: bool,
     app_args: Vec<String>,
 ) -> Result<()> {
-    let mut sandbox = Sandbox::builder(kernel)
-        .initrd_file(initrd)
-        .heap_size(heap_size)
-        .args(app_args)
-        .build()?;
-    sandbox.restore()?;
-
-    // Pyhl mode: warm up the Python interpreter before snapshotting
-    if warmup {
-        let _: () = sandbox.call_named("run", "pass".to_string())?;
-    }
-
-    sandbox.snapshot_now()?;
-    sandbox.save_snapshot(snapshot)?;
+    create_snapshot(kernel, initrd, snapshot, heap_size, warmup, app_args)?;
     println!("SNAPSHOT_OK");
     Ok(())
 }
 
-// ── Cold snapstart ──────────────────────────────────────────────────────
-//
-// Hyperlight always runs from a pre-warmed snapshot in production
-// (pulled from OCI). What we call "cold" is loading a snapshot from
-// disk — NOT booting a fresh VM.
+// ── Measured snapshot generation ────────────────────────────────────────
 
-fn cold(initrd: &Path, snapshot: &Path, script: Option<&Path>) -> Result<()> {
+fn snapshot_generation(
+    kernel: &Path,
+    initrd: &Path,
+    snapshot: &Path,
+    heap_size: u64,
+    warmup: bool,
+    app_args: Vec<String>,
+) -> Result<()> {
+    let timings = create_snapshot(kernel, initrd, snapshot, heap_size, warmup, app_args)?;
+    let warmup_phase = timings
+        .warmup_ms
+        .map(|ms| format!(" guest_call_ms={ms:.6}"))
+        .unwrap_or_default();
+    println!(
+        "BENCHMARK_PHASE sandbox_build_ms={:.6} initial_rewind_ms={:.6}{} \
+         snapshot_capture_ms={:.6} snapshot_persist_ms={:.6}",
+        timings.sandbox_build_ms,
+        timings.initial_rewind_ms,
+        warmup_phase,
+        timings.snapshot_capture_ms,
+        timings.snapshot_persist_ms,
+    );
+    println!("BENCHMARK_OK");
+    Ok(())
+}
+
+// ── Persisted snapshot resume ───────────────────────────────────────────
+
+fn restore(initrd: &Path, snapshot: &Path, script: Option<&Path>) -> Result<()> {
     let load_started = Instant::now();
     let mut sandbox =
         Sandbox::from_snapshot_file_configured(snapshot, &[], Some(initrd), None, None)?;
@@ -117,12 +181,12 @@ fn usage(program: &str) -> String {
         "usage:\n\
          \n  Prepare (untimed snapshot creation):\n  \
          {program} capture <kernel> <initrd> <snapshot-dir> [--warmup] [--heap-size 2560Mi] [-- app-args]\n\
-         \n  Cold snapstart (load from persisted snapshot + execute):\n  \
-         {program} cold <initrd> <snapshot-dir> [<script>]\n\
+         \n  Snapshot generation (create and persist a measured scratch snapshot):\n  \
+         {program} snapshot-generation <kernel> <initrd> <snapshot-dir> [--warmup] [--heap-size 2560Mi] [-- app-args]\n\
+         \n  Persisted snapshot resume (load snapshot + execute):\n  \
+         {program} restore <initrd> <snapshot-dir> [<script>]\n\
          \n  Warm reuse (reuse partition, re-call without reload):\n  \
-         {program} warm <initrd> <snapshot-dir> <script> [--iterations 10]\n\
-         \n  NOTE: Hyperlight always runs from a pre-warmed snapshot in production.\n  \
-         There is no raw kernel+initrd boot path in the benchmark."
+         {program} warm <initrd> <snapshot-dir> <script> [--iterations 10]"
     )
 }
 
@@ -154,9 +218,17 @@ fn main() -> Result<()> {
             warmup,
             app_args,
         ),
-        Some("cold") if args.len() >= 4 => {
+        Some("snapshot-generation") if args.len() >= 5 => snapshot_generation(
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+            Path::new(&args[4]),
+            heap_size,
+            warmup,
+            app_args,
+        ),
+        Some("restore") if args.len() >= 4 => {
             let script = args.get(4).map(|s| Path::new(s.as_str()));
-            cold(Path::new(&args[2]), Path::new(&args[3]), script)
+            restore(Path::new(&args[2]), Path::new(&args[3]), script)
         }
         Some("warm") if args.len() >= 5 => warm(
             Path::new(&args[2]),

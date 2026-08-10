@@ -1,1 +1,2 @@
 *.patch text eol=lf
+samples/*.sh text eol=lf

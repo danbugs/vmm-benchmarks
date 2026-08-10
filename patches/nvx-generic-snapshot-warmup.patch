@@ -1,22 +1,168 @@
 diff --git a/alpine/snapshot-trampoline.py b/alpine/snapshot-trampoline.py
-index f581e82..2493f20 100644
+index f581e82..68de89e 100644
 --- a/alpine/snapshot-trampoline.py
 +++ b/alpine/snapshot-trampoline.py
-@@ -48,0 +49 @@ def warm_interpreter() -> None:
+@@ -9 +8,0 @@ Optional warmup is explicit so baseline benchmarks can measure an untrained inte
+-import ctypes
+@@ -11,0 +11 @@ import runpy
++import subprocess
+@@ -12,0 +13,2 @@ import sys
++import time
++import traceback
+@@ -14,0 +17,2 @@ USAGE = "usage: snapshot-trampoline.py [--mount TAG DIR MODE] [--warmup] APP"
++BENCHMARK_ITERATIONS_FILE = ".vmm-benchmark-iterations"
++EXIT_PORT = 0x604
+@@ -16 +19,0 @@ SNAPSHOT_PORT = 0x605
+-MS_RDONLY = 1
+@@ -48,0 +52 @@ def warm_interpreter() -> None:
 +    import pypandoc
-@@ -51,0 +53 @@ def warm_interpreter() -> None:
+@@ -51,0 +56 @@ def warm_interpreter() -> None:
 +    assert pypandoc.__version__ == "1.17"
-@@ -85,0 +88 @@ def main(argv: list[str]) -> None:
+@@ -54 +59 @@ def warm_interpreter() -> None:
+-def request_snapshot() -> None:
++def write_port(port: int, value: int) -> None:
+@@ -56,2 +61,10 @@ def request_snapshot() -> None:
+-        device.seek(SNAPSHOT_PORT)
+-        device.write(b"\x01")
++        device.seek(port)
++        device.write(bytes([value & 0xFF]))
++
++
++def request_snapshot() -> None:
++    write_port(SNAPSHOT_PORT, 1)
++
++
++def request_exit(status: int) -> None:
++    write_port(EXIT_PORT, status)
+@@ -64,15 +77,88 @@ def mount_hostfs(tag: str, directory: str, mode: str) -> None:
+-    libc = ctypes.CDLL(None, use_errno=True)
+-    mount = libc.mount
+-    mount.argtypes = [
+-        ctypes.c_char_p,
+-        ctypes.c_char_p,
+-        ctypes.c_char_p,
+-        ctypes.c_ulong,
+-        ctypes.c_void_p,
+-    ]
+-    mount.restype = ctypes.c_int
+-    flags = MS_RDONLY if mode == "ro" else 0
+-    if mount(tag.encode(), directory.encode(), b"virtiofs", flags, None) != 0:
+-        error = ctypes.get_errno()
+-        raise SystemExit(
+-            f"virtfs: failed to mount tag {tag} at {directory}: {os.strerror(error)}"
++    completed = subprocess.run(
++        ["mount", "-t", "virtiofs", "-o", mode, tag, directory],
++        check=False,
++    )
++    if completed.returncode != 0:
++        raise SystemExit(f"virtfs: failed to mount tag {tag} at {directory}")
++
++
++def benchmark_iterations(app: str) -> int | None:
++    control = os.path.join(os.path.dirname(app), BENCHMARK_ITERATIONS_FILE)
++    try:
++        with open(control, encoding="ascii") as source:
++            value = int(source.read().strip())
++    except FileNotFoundError:
++        return None
++    except ValueError as error:
++        raise SystemExit(f"invalid benchmark iteration count in {control}") from error
++    if value <= 0:
++        raise SystemExit(f"benchmark iteration count must be positive: {value}")
++    return value
++
++
++def system_exit_code(error: SystemExit) -> int:
++    if error.code is None:
++        return 0
++    if isinstance(error.code, int):
++        return error.code & 0xFF
++    print(error.code, file=sys.stderr)
++    return 1
++
++
++def wait_for_child(child: int) -> int:
++    while True:
++        try:
++            return os.waitpid(child, 0)[1]
++        except InterruptedError:
++            continue
++
++
++def run_isolated(app: str) -> tuple[int, float, float]:
++    sys.stdout.flush()
++    sys.stderr.flush()
++    timing_reader, timing_writer = os.pipe()
++    cycle_started = time.perf_counter_ns()
++    child = os.fork()
++    if child == 0:
++        os.close(timing_reader)
++        status = 0
++        call_started = time.perf_counter_ns()
++        try:
++            runpy.run_path(app, run_name="__main__")
++        except SystemExit as error:
++            status = system_exit_code(error)
++        except BaseException:
++            traceback.print_exc()
++            status = 1
++        call_ns = time.perf_counter_ns() - call_started
++        sys.stdout.flush()
++        sys.stderr.flush()
++        os.write(timing_writer, str(call_ns).encode("ascii"))
++        os.close(timing_writer)
++        os._exit(status)
++
++    os.close(timing_writer)
++    chunks = []
++    while chunk := os.read(timing_reader, 64):
++        chunks.append(chunk)
++    os.close(timing_reader)
++    wait_status = wait_for_child(child)
++    cycle_ns = time.perf_counter_ns() - cycle_started
++    timing = b"".join(chunks)
++    call_ns = int(timing) if timing else cycle_ns
++    if os.WIFEXITED(wait_status):
++        status = os.WEXITSTATUS(wait_status)
++    elif os.WIFSIGNALED(wait_status):
++        status = 128 + os.WTERMSIG(wait_status)
++    else:
++        status = 127
++    return status, call_ns / 1_000_000, max(0, cycle_ns - call_ns) / 1_000_000
++
++
++def run_benchmark(app: str, iterations: int) -> int:
++    for iteration in range(iterations):
++        status, call_ms, rewind_ms = run_isolated(app)
++        print(
++            f"BENCHMARK_PHASE warm_iteration={iteration} "
++            f"guest_call_ms={call_ms:.6f} rewind_ms={rewind_ms:.6f}",
++            flush=True,
+@@ -79,0 +166,4 @@ def mount_hostfs(tag: str, directory: str, mode: str) -> None:
++        if status != 0:
++            return status
++    print("BENCHMARK_OK", flush=True)
++    return 0
+@@ -85,0 +176 @@ def main(argv: list[str]) -> None:
 +    exec(compile("pass", "<snapshot-warmup>", "exec"), {"__name__": "__main__"})
+@@ -89 +180,7 @@ def main(argv: list[str]) -> None:
+-    runpy.run_path(app, run_name="__main__")
++    iterations = benchmark_iterations(app)
++    if iterations is None:
++        runpy.run_path(app, run_name="__main__")
++        return
++    status = run_benchmark(app, iterations)
++    request_exit(status)
++    raise SystemExit(status)
 diff --git a/docker/Dockerfile b/docker/Dockerfile
-index 08aa845..4eca5e2 100644
+index 3a2b868..8861240 100644
 --- a/docker/Dockerfile
 +++ b/docker/Dockerfile
 @@ -61 +61 @@ RUN mkdir -p /out && python3 /repo/scripts/nvx.py build-initramfs
 -# ---- Python initramfs: Alpine rootfs + CPython + numpy/pandas + the snapshot apps. ----
-+# ---- Python initramfs: Alpine rootfs + CPython + numpy/pandas/pypandoc + snapshot apps. ----
++# ---- Workload initramfs: CPython, numpy/pandas/pypandoc, Pandoc, Node.js and snapshot apps. ----
 diff --git a/scripts/nvx_tools/build.py b/scripts/nvx_tools/build.py
-index c43a497..2d6becc 100644
+index 19c67b8..414476a 100644
 --- a/scripts/nvx_tools/build.py
 +++ b/scripts/nvx_tools/build.py
 @@ -4,0 +5 @@ from __future__ import annotations
@@ -25,18 +171,20 @@ index c43a497..2d6becc 100644
 +import zipfile
 @@ -66,0 +69 @@ class PythonInitramfsProfile:
 +    wheels: tuple[tuple[str, str], ...]
-@@ -77 +80,7 @@ PYTHON_INITRAMFS_PROFILES = {
+@@ -89 +92,7 @@ PYTHON_INITRAMFS_PROFILES = {
 -        packages=("python3", "py3-numpy", "py3-pandas"),
-+        packages=("python3", "py3-numpy", "py3-pandas", "pandoc"),
++        packages=("python3", "py3-numpy", "py3-pandas", "pandoc", "nodejs"),
 +        wheels=(
 +            (
 +                "pypandoc-1.17-py3-none-any.whl",
 +                "01fdbffa61edb9f8e82e8faad6954efcb7b6f8f0634aead4d89e322a00225a67",
 +            ),
 +        ),
-@@ -96,0 +106 @@ PYTHON_INITRAMFS_PROFILES = {
+@@ -108,0 +118 @@ PYTHON_INITRAMFS_PROFILES = {
 +        wheels=(),
-@@ -325,0 +336,24 @@ def _normalize_initramfs_metadata(root: Path) -> None:
+@@ -124,0 +135 @@ PYTHON_INITRAMFS_PROFILES = {
++        wheels=(),
+@@ -344,0 +356,24 @@ def _normalize_initramfs_metadata(root: Path) -> None:
 +def _install_python_wheel(root: Path, name: str, expected_sha256: str) -> None:
 +    wheel = REPO_ROOT / "alpine" / name
 +    if not wheel.is_file():
@@ -61,22 +209,70 @@ index c43a497..2d6becc 100644
 +        archive.extractall(site_packages[0])
 +
 +
-@@ -407,0 +442,2 @@ def build_python_initramfs_native(
+@@ -426,0 +462,2 @@ def build_python_initramfs_native(
 +    for wheel_name, wheel_sha256 in profile.wheels:
 +        _install_python_wheel(root, wheel_name, wheel_sha256)
 diff --git a/scripts/tests/test_nvx_tools.py b/scripts/tests/test_nvx_tools.py
-index d608be5..462071e 100644
+index 5038799..cba7acb 100644
 --- a/scripts/tests/test_nvx_tools.py
 +++ b/scripts/tests/test_nvx_tools.py
-@@ -1125 +1125,4 @@ class BuildTests(unittest.TestCase):
+@@ -1286 +1286,5 @@ class BuildTests(unittest.TestCase):
 -        self.assertTrue(PYTHON_INITRAMFS_PROFILES["full"].prune_runtime)
 +        profile = PYTHON_INITRAMFS_PROFILES["full"]
 +        self.assertTrue(profile.prune_runtime)
 +        self.assertIn("pandoc", profile.packages)
++        self.assertIn("nodejs", profile.packages)
 +        self.assertEqual(profile.wheels[0][0], "pypandoc-1.17-py3-none-any.whl")
-@@ -1128 +1131 @@ class BuildTests(unittest.TestCase):
+@@ -1289 +1293 @@ class BuildTests(unittest.TestCase):
 -            PYTHON_INITRAMFS_PROFILES["full"].sources,
 +            profile.sources,
-@@ -1150 +1153 @@ class BuildTests(unittest.TestCase):
+@@ -1304,2 +1308,3 @@ class BuildTests(unittest.TestCase):
+-        self.assertIn("device.seek(SNAPSHOT_PORT)", trampoline)
+-        self.assertIn('device.write(b"\\x01")', trampoline)
++        self.assertIn("device.seek(port)", trampoline)
++        self.assertIn("write_port(SNAPSHOT_PORT, 1)", trampoline)
++        self.assertIn("write_port(EXIT_PORT, status)", trampoline)
+@@ -1311 +1316 @@ class BuildTests(unittest.TestCase):
 -        for dependency in ("numpy", "pandas"):
 +        for dependency in ("numpy", "pandas", "pypandoc"):
+@@ -1333 +1338 @@ class BuildTests(unittest.TestCase):
+-        trampoline = (REPO_ROOT / "alpine" / "snapshot-trampoline.py").read_text(
++        source = (REPO_ROOT / "alpine" / "snapshot-trampoline.py").read_text(
+@@ -1336 +1341 @@ class BuildTests(unittest.TestCase):
+-        body = trampoline.split("def main(", 1)[1]
++        body = source.split("def main(", 1)[1]
+@@ -1339 +1344,33 @@ class BuildTests(unittest.TestCase):
+-        self.assertLess(body.index("mount_hostfs"), body.index("runpy.run_path"))
++        self.assertLess(body.index("mount_hostfs"), body.index("benchmark_iterations"))
++        self.assertNotIn("import ctypes", source)
++
++    def test_trampoline_mounts_virtiofs_with_busybox_mount(self) -> None:
++        trampoline = runpy.run_path(REPO_ROOT / "alpine" / "snapshot-trampoline.py")
++        mount = trampoline["mount_hostfs"]
++
++        with (
++            tempfile.TemporaryDirectory() as directory,
++            patch.object(trampoline["subprocess"], "run") as run,
++        ):
++            run.return_value.returncode = 0
++            mount("nvx", directory, "ro")
++
++        run.assert_called_once_with(
++            ["mount", "-t", "virtiofs", "-o", "ro", "nvx", directory],
++            check=False,
++        )
++
++    def test_trampoline_enables_warm_iterations_with_a_host_control_file(self) -> None:
++        trampoline = runpy.run_path(REPO_ROOT / "alpine" / "snapshot-trampoline.py")
++        iterations = trampoline["benchmark_iterations"]
++        control_name = trampoline["BENCHMARK_ITERATIONS_FILE"]
++
++        with tempfile.TemporaryDirectory() as directory:
++            app = Path(directory) / "app.py"
++            app.touch()
++            self.assertIsNone(iterations(str(app)))
++            (Path(directory) / control_name).write_text("7", encoding="ascii")
++            self.assertEqual(iterations(str(app)), 7)
++            (Path(directory) / control_name).write_text("0", encoding="ascii")
++            with self.assertRaisesRegex(SystemExit, "must be positive"):
++                iterations(str(app))
