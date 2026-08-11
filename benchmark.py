@@ -80,14 +80,17 @@ HYPERLIGHT_WORKLOAD_IMAGE: dict[str, str] = {
     "pandoc-docx-stdlib": "ghcr.io/danbugs/vmm-benchmarks/pyhl:latest",
     "pandoc-native": "ghcr.io/danbugs/vmm-benchmarks/pandoc-native:latest",
     "nodejs-hello": "ghcr.io/danbugs/vmm-benchmarks/nodejs:latest",
+    "nodejs-compile-test": "ghcr.io/danbugs/vmm-benchmarks/nodejs-compile-test:latest",
 }
 HYPERLIGHT_APP_ARGS: dict[str, tuple[str, ...]] = {
     "pandoc-native": ("/bin/run-pandoc.sh",),
     "nodejs-hello": ("/app/hello.js",),
+    "nodejs-compile-test": ("/app/build-and-test.js",),
 }
 HYPERLIGHT_EMBEDDED_MARKERS = {
     "pandoc-native": "PANDOC_DOCX_OK",
     "nodejs-hello": "Hello from Node.js on Hyperlight!",
+    "nodejs-compile-test": "NODE_TEST_OK",
 }
 # Workloads using pyhl mode (call_named with script); others use generic (call_run)
 HYPERLIGHT_PYHL_WORKLOADS = {"hello", "pandoc-docx-stdlib"}
@@ -106,13 +109,14 @@ VMM_PLOT_COLORS = {
     "nanvix": "#16a34a",
     "hyperlight": "#dc2626",
 }
-WORKLOAD_ORDER = ("hello", "pandoc-docx-stdlib", "pandoc-docx", "pandoc-native", "nodejs-hello")
+WORKLOAD_ORDER = ("hello", "pandoc-docx-stdlib", "pandoc-docx", "pandoc-native", "nodejs-hello", "nodejs-compile-test")
 WORKLOAD_LABELS = {
     "hello": "Python hello.py",
     "pandoc-docx-stdlib": "Python stdlib Markdown-to-DOCX",
     "pandoc-docx": "Python + pypandoc Markdown to DOCX",
     "pandoc-native": "Pandoc native Markdown-to-DOCX",
     "nodejs-hello": "Node.js hello",
+    "nodejs-compile-test": "Node.js compile-and-test",
 }
 WORKLOAD_TITLES = {
     "hello": "Python Hello-World",
@@ -120,6 +124,7 @@ WORKLOAD_TITLES = {
     "pandoc-docx": "Python pypandoc Markdown-to-DOCX",
     "pandoc-native": "Pandoc native Markdown-to-DOCX",
     "nodejs-hello": "Node.js Hello-World",
+    "nodejs-compile-test": "Node.js Compile and Test",
 }
 WORKLOAD_VMMS: dict[str, tuple[str, ...]] = {
     "hello": VMM_ORDER,
@@ -127,6 +132,7 @@ WORKLOAD_VMMS: dict[str, tuple[str, ...]] = {
     "pandoc-docx": ("nvx",),
     "pandoc-native": ("nvx", "hyperlight"),
     "nodejs-hello": ("nvx", "hyperlight"),
+    "nodejs-compile-test": ("hyperlight",),
 }
 WORKLOAD_SAMPLES: dict[str, Path | None] = {
     "hello": HELLO_SAMPLE,
@@ -134,6 +140,7 @@ WORKLOAD_SAMPLES: dict[str, Path | None] = {
     "pandoc-docx": PANDOC_DOCX_SAMPLE,
     "pandoc-native": PANDOC_NATIVE_SAMPLE,
     "nodejs-hello": NODEJS_HELLO_SAMPLE,
+    "nodejs-compile-test": None,
 }
 WORKLOAD_SAMPLE_VMMS: dict[str, tuple[str, ...]] = {
     "hello": VMM_ORDER,
@@ -141,6 +148,7 @@ WORKLOAD_SAMPLE_VMMS: dict[str, tuple[str, ...]] = {
     "pandoc-docx": ("nvx",),
     "pandoc-native": ("nvx",),
     "nodejs-hello": ("nvx",),
+    "nodejs-compile-test": (),
 }
 WORKLOAD_MARKERS = {
     "hello": "hello world",
@@ -148,6 +156,7 @@ WORKLOAD_MARKERS = {
     "pandoc-docx": "PANDOC_DOCX_OK",
     "pandoc-native": "PANDOC_DOCX_OK",
     "nodejs-hello": "hello",
+    "nodejs-compile-test": "NODE_TEST_OK",
 }
 RSS_VMM_ORDER = ("nanvix", "nvx", "hyperlight")
 GUEST_MEMORY_MIB: dict[str, dict[str, int]] = {
@@ -169,6 +178,9 @@ GUEST_MEMORY_MIB: dict[str, dict[str, int]] = {
     },
     "nodejs-hello": {
         "nvx": 1536,
+        "hyperlight": 512,
+    },
+    "nodejs-compile-test": {
         "hyperlight": 512,
     },
 }
@@ -1612,18 +1624,21 @@ def prepare(
         )
 
         # Warm reuse — load snapshot once, call guest repeatedly with
-        # in-memory state rewind between calls.  Only pyhl workloads
-        # support warm reuse (they use call_named with a script).
+        # in-memory state rewind between calls.  pyhl workloads pass a
+        # script to call_named; non-pyhl use call_run (no script arg).
         if is_pyhl:
             assert sample is not None
-            specs[("hyperlight", "warm")] = CommandSpec(
-                "hyperlight",
-                "warm",
-                runner,
-                ("warm", str(hl_initrd), str(snapshot), str(sample)),
-                HYPERLIGHT_RUNNER_DIR,
-                "BENCHMARK_OK",
-            )
+            warm_args = ("warm", str(hl_initrd), str(snapshot), str(sample))
+        else:
+            warm_args = ("warm", str(hl_initrd), str(snapshot))
+        specs[("hyperlight", "warm")] = CommandSpec(
+            "hyperlight",
+            "warm",
+            runner,
+            warm_args,
+            HYPERLIGHT_RUNNER_DIR,
+            "BENCHMARK_OK",
+        )
 
     previous_commands = previous_manifest.get("commands", {})
     commands = (
