@@ -152,8 +152,8 @@ fn restore(initrd: &Path, snapshot: &Path, script: Option<&Path>) -> Result<()> 
 
 // ── Warm reuse ──────────────────────────────────────────────────────────
 
-fn warm(initrd: &Path, snapshot: &Path, script: &Path, iterations: usize) -> Result<()> {
-    let source = fs::read_to_string(script)?;
+fn warm(initrd: &Path, snapshot: &Path, script: Option<&Path>, iterations: usize) -> Result<()> {
+    let source = script.map(fs::read_to_string).transpose()?;
     let load_started = Instant::now();
     let mut sandbox =
         Sandbox::from_snapshot_file_configured(snapshot, &[], Some(initrd), None, None)?;
@@ -162,7 +162,10 @@ fn warm(initrd: &Path, snapshot: &Path, script: &Path, iterations: usize) -> Res
 
     for i in 0..iterations {
         let call_started = Instant::now();
-        let _: () = sandbox.call_named("run", source.clone())?;
+        match &source {
+            Some(src) => { let _: () = sandbox.call_named("run", src.clone())?; }
+            None => sandbox.call_run()?,
+        }
         let call_ms = call_started.elapsed().as_secs_f64() * 1000.0;
         let rewind_started = Instant::now();
         sandbox.restore()?;
@@ -186,7 +189,7 @@ fn usage(program: &str) -> String {
          \n  Persisted snapshot resume (load snapshot + execute):\n  \
          {program} restore <initrd> <snapshot-dir> [<script>]\n\
          \n  Warm reuse (reuse partition, re-call without reload):\n  \
-         {program} warm <initrd> <snapshot-dir> <script> [--iterations 10]"
+         {program} warm <initrd> <snapshot-dir> [<script>] [--iterations 10]"
     )
 }
 
@@ -230,10 +233,10 @@ fn main() -> Result<()> {
             let script = args.get(4).map(|s| Path::new(s.as_str()));
             restore(Path::new(&args[2]), Path::new(&args[3]), script)
         }
-        Some("warm") if args.len() >= 5 => warm(
+        Some("warm") if args.len() >= 4 => warm(
             Path::new(&args[2]),
             Path::new(&args[3]),
-            Path::new(&args[4]),
+            args.get(4).filter(|s| !s.starts_with("--")).map(|s| Path::new(s.as_str())),
             iterations,
         ),
         _ => Err(usage(&args[0]).into()),
