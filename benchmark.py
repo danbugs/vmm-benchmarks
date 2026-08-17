@@ -13,17 +13,23 @@ import math
 import os
 import platform
 import random
+import re
 import shutil
 import statistics
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import zipfile
 import xml.etree.ElementTree as ElementTree
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from http.client import HTTPResponse
 from pathlib import Path
 from typing import Generator, Iterable, Sequence, cast
 
@@ -37,6 +43,8 @@ HYPERLIGHT_DIR = SCRIPT_DIR / "hyperlight-unikraft"
 HYPERLIGHT_RUNNER_DIR = SCRIPT_DIR / "hyperlight-runner"
 PATCHES_DIR = SCRIPT_DIR / "patches"
 BUILD_RECEIPTS_DIR = SCRIPT_DIR / ".build-receipts"
+BUILD_ARTIFACTS_DIR = SCRIPT_DIR / ".build-artifacts"
+HYPERLIGHT_ARTIFACT_CACHE_DIR = BUILD_ARTIFACTS_DIR / "hyperlight"
 SAMPLES_DIR = SCRIPT_DIR / "samples"
 HELLO_SAMPLE = SAMPLES_DIR / "hello.py"
 PANDOC_DOCX_SAMPLE = SAMPLES_DIR / "pandoc_docx.py"
@@ -191,6 +199,18 @@ SNAPSHOT_GENERATION_SAMPLES = 1
 GENERIC_SNAPSHOT_WARMUP = "pass"
 MANIFEST_FORMAT = 5
 HYPERLIGHT_SNAPSHOT_FORMAT = 3
+HYPERLIGHT_ARTIFACT_CACHE_FORMAT = 1
+OCI_INDEX_MEDIA_TYPES = {
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+}
+OCI_MANIFEST_MEDIA_TYPES = {
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+}
+OCI_MANIFEST_ACCEPT = ", ".join(
+    [*sorted(OCI_INDEX_MEDIA_TYPES), *sorted(OCI_MANIFEST_MEDIA_TYPES)]
+)
 PHASE_FIELDS = (
     "sandbox_build_ms",
     "initial_rewind_ms",
@@ -398,7 +418,7 @@ def require_build_receipt(
     if actual != expected:
         raise RuntimeError(
             f"{vmm} artifacts were not built with the current benchmark provenance; "
-            "rerun with --build"
+            "rerun with --build --use-docker"
         )
 
 
@@ -462,9 +482,281 @@ def temporary_submodule_patch(
             )
 
 
-def remove_docker_container(name: str) -> None:
+def parse_oci_image(image: str) -> tuple[str, str, str]:
+    registry, separator, repository_reference = image.partition("/")
+    if not separator or not registry or not repository_reference:
+        raise RuntimeError(f"OCI image must include a registry and repository: {image}")
+    if "@" in repository_reference:
+        repository, reference = repository_reference.rsplit("@", 1)
+    else:
+        repository, tag_separator, reference = repository_reference.rpartition(":")
+        if not tag_separator or "/" in reference:
+            repository = repository_reference
+            reference = "latest"
+    if not repository or not reference:
+        raise RuntimeError(f"invalid OCI image reference: {image}")
+    return registry, repository, reference
+
+
+def verify_sha256_digest(data: bytes, digest: str, subject: str) -> None:
+    algorithm, separator, expected = digest.partition(":")
+    if separator != ":" or algorithm != "sha256" or not expected:
+        raise RuntimeError(f"unsupported digest for {subject}: {digest}")
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
+        raise RuntimeError(
+            f"SHA-256 mismatch for {subject}: expected {expected}, got {actual}"
+        )
+
+
+class OciRegistryClient:
+    def __init__(self, registry: str, repository: str) -> None:
+        self.registry = registry
+        self.repository = repository
+        self.authorization: str | None = None
+
+    def _url(self, path: str) -> str:
+        return f"https://{self.registry}/v2/{self.repository}/{path}"
+
+    @staticmethod
+    def _open(request: urllib.request.Request) -> HTTPResponse:
+        try:
+            return cast(HTTPResponse, urllib.request.urlopen(request, timeout=120))
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"OCI registry request failed: {error}") from error
+
+    def _authorize(self, challenge: str) -> None:
+        scheme, separator, parameters = challenge.partition(" ")
+        if not separator or scheme.lower() != "bearer":
+            raise RuntimeError(
+                f"OCI registry returned an unsupported authentication challenge: {challenge}"
+            )
+        values = dict(re.findall(r'(\w+)="([^"]*)"', parameters))
+        realm = values.get("realm")
+        service = values.get("service")
+        scope = values.get("scope", f"repository:{self.repository}:pull")
+        if not realm or not service or not realm.startswith("https://"):
+            raise RuntimeError("OCI registry returned an invalid bearer challenge")
+        token_query = urllib.parse.urlencode(
+            {
+                "service": service,
+                "scope": scope,
+            }
+        )
+        token_url = f"{realm}?{token_query}"
+        request = urllib.request.Request(
+            token_url,
+            headers={"User-Agent": "vmm-benchmarks"},
+        )
+        try:
+            with self._open(request) as response:
+                payload: object = json.loads(response.read())
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise RuntimeError("OCI registry returned an invalid token response") from error
+        if not isinstance(payload, dict):
+            raise RuntimeError("OCI registry returned an invalid token response")
+        token = payload.get("token", payload.get("access_token"))
+        if not isinstance(token, str) or not token:
+            raise RuntimeError("OCI registry token response did not include a token")
+        self.authorization = f"Bearer {token}"
+
+    def request(self, path: str, *, accept: str | None = None) -> HTTPResponse:
+        headers = {"User-Agent": "vmm-benchmarks"}
+        if accept is not None:
+            headers["Accept"] = accept
+        if self.authorization is not None:
+            headers["Authorization"] = self.authorization
+        request = urllib.request.Request(self._url(path), headers=headers)
+        try:
+            return self._open(request)
+        except urllib.error.HTTPError as error:
+            if error.code != 401:
+                raise RuntimeError(
+                    f"OCI registry request failed with HTTP {error.code}: {self._url(path)}"
+                ) from error
+            challenge = error.headers.get("WWW-Authenticate", "")
+            error.close()
+            self._authorize(challenge)
+
+        headers["Authorization"] = cast(str, self.authorization)
+        retry = urllib.request.Request(self._url(path), headers=headers)
+        try:
+            return self._open(retry)
+        except urllib.error.HTTPError as error:
+            raise RuntimeError(
+                f"OCI registry request failed with HTTP {error.code}: {self._url(path)}"
+            ) from error
+
+    def manifest(self, reference: str) -> dict[str, object]:
+        quoted_reference = urllib.parse.quote(reference, safe=":")
+        with self.request(
+            f"manifests/{quoted_reference}",
+            accept=OCI_MANIFEST_ACCEPT,
+        ) as response:
+            body = response.read()
+            digest = response.headers.get("Docker-Content-Digest")
+        if digest is not None:
+            verify_sha256_digest(body, digest, f"manifest {reference}")
+        try:
+            manifest: object = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise RuntimeError(
+                f"OCI registry returned an invalid manifest for {reference}"
+            ) from error
+        if not isinstance(manifest, dict):
+            raise RuntimeError(f"OCI manifest for {reference} is not an object")
+        return cast(dict[str, object], manifest)
+
+    def download_blob(self, digest: str, destination: Path) -> None:
+        algorithm, separator, expected = digest.partition(":")
+        if separator != ":" or algorithm != "sha256" or not expected:
+            raise RuntimeError(f"unsupported OCI blob digest: {digest}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        hasher = hashlib.sha256()
+        quoted_digest = urllib.parse.quote(digest, safe=":")
+        with (
+            self.request(f"blobs/{quoted_digest}") as response,
+            destination.open("wb") as output,
+        ):
+            for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                output.write(chunk)
+                hasher.update(chunk)
+        actual = hasher.hexdigest()
+        if actual != expected:
+            destination.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"SHA-256 mismatch for OCI blob {digest}: got {actual}"
+            )
+
+
+def resolve_oci_layers(
+    client: OciRegistryClient,
+    reference: str,
+) -> list[dict[str, object]]:
+    manifest = client.manifest(reference)
+    media_type = manifest.get("mediaType")
+    if media_type in OCI_INDEX_MEDIA_TYPES:
+        manifests = manifest.get("manifests")
+        if not isinstance(manifests, list):
+            raise RuntimeError("OCI image index does not contain manifests")
+        selected: dict[str, object] | None = None
+        for candidate in manifests:
+            if not isinstance(candidate, dict):
+                continue
+            platform_value = candidate.get("platform")
+            if not isinstance(platform_value, dict):
+                continue
+            if (
+                platform_value.get("os") == "linux"
+                and platform_value.get("architecture") == "amd64"
+            ):
+                selected = cast(dict[str, object], candidate)
+                break
+        if selected is None:
+            raise RuntimeError("OCI image has no linux/amd64 manifest")
+        digest = selected.get("digest")
+        if not isinstance(digest, str):
+            raise RuntimeError("OCI linux/amd64 manifest has no digest")
+        manifest = client.manifest(digest)
+        media_type = manifest.get("mediaType")
+    if media_type not in OCI_MANIFEST_MEDIA_TYPES:
+        raise RuntimeError(f"unsupported OCI manifest media type: {media_type!r}")
+    layers = manifest.get("layers")
+    if not isinstance(layers, list):
+        raise RuntimeError("OCI image manifest does not contain layers")
+    if not all(isinstance(layer, dict) for layer in layers):
+        raise RuntimeError("OCI image manifest contains an invalid layer")
+    return cast(list[dict[str, object]], layers)
+
+
+def extract_oci_artifacts(
+    image: str,
+    artifacts: dict[str, Path],
+) -> None:
+    def normalize_path(path: str) -> str:
+        normalized = path.replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized.lstrip("/")
+
+    registry, repository, reference = parse_oci_image(image)
+    client = OciRegistryClient(registry, repository)
+    layers = resolve_oci_layers(client, reference)
+    normalized_artifacts = {
+        normalize_path(source): destination
+        for source, destination in artifacts.items()
+    }
+    whiteouts: dict[str, Path] = {}
+    for source, destination in normalized_artifacts.items():
+        parent, separator, name = source.rpartition("/")
+        whiteout = f"{parent}{separator}.wh.{name}"
+        whiteouts[whiteout] = destination
+    for destination in artifacts.values():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.unlink(missing_ok=True)
+
+    print(f"+ (OCI) pull {image}", flush=True)
+    HYPERLIGHT_ARTIFACT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="hyperlight-oci-",
+        dir=HYPERLIGHT_ARTIFACT_CACHE_DIR,
+    ) as temporary_dir:
+        temporary = Path(temporary_dir)
+        for index, layer in enumerate(layers):
+            digest = layer.get("digest")
+            media_type = layer.get("mediaType")
+            if not isinstance(digest, str) or not isinstance(media_type, str):
+                raise RuntimeError("OCI image manifest contains an invalid layer")
+            if "zstd" in media_type:
+                raise RuntimeError(
+                    "zstd-compressed OCI layers require --use-docker"
+                )
+            blob = temporary / f"layer-{index}.tar"
+            client.download_blob(digest, blob)
+            try:
+                with tarfile.open(blob, mode="r:*") as archive:
+                    for member in archive:
+                        name = normalize_path(member.name)
+                        whiteout_destination = whiteouts.get(name)
+                        if whiteout_destination is not None:
+                            whiteout_destination.unlink(missing_ok=True)
+                            continue
+                        destination = normalized_artifacts.get(name)
+                        if destination is None:
+                            continue
+                        if not member.isfile():
+                            raise RuntimeError(
+                                f"OCI artifact is not a regular file: /{name}"
+                            )
+                        source_file = archive.extractfile(member)
+                        if source_file is None:
+                            raise RuntimeError(
+                                f"cannot read OCI artifact from layer: /{name}"
+                            )
+                        with source_file, destination.open("wb") as output:
+                            shutil.copyfileobj(source_file, output)
+            except tarfile.TarError as error:
+                raise RuntimeError(
+                    f"cannot read OCI layer {digest}: {error}"
+                ) from error
+            blob.unlink()
+
+    missing = [
+        source
+        for source, destination in artifacts.items()
+        if not destination.is_file()
+    ]
+    if missing:
+        raise RuntimeError(
+            f"OCI image {image} does not contain: {', '.join(missing)}"
+        )
+
+
+def remove_docker_container(docker: str, name: str) -> None:
     subprocess.run(
-        ["docker", "rm", "-f", name],
+        [docker, "rm", "-f", name],
         cwd=SCRIPT_DIR,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -472,24 +764,130 @@ def remove_docker_container(name: str) -> None:
     )
 
 
-def extract_docker_artifact(image: str, source: str, destination: Path) -> None:
-    container = f"vmm-benchmark-{destination.stem}-{os.getpid()}"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.unlink(missing_ok=True)
-    run_checked(["docker", "pull", image], cwd=SCRIPT_DIR)
-    remove_docker_container(container)
+def extract_docker_artifacts(
+    docker: str,
+    image: str,
+    artifacts: dict[str, Path],
+) -> None:
+    container_key = hashlib.sha256(image.encode("utf-8")).hexdigest()[:12]
+    container = f"vmm-benchmark-{container_key}-{os.getpid()}"
+    for destination in artifacts.values():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.unlink(missing_ok=True)
+    run_checked([docker, "pull", image], cwd=SCRIPT_DIR)
+    remove_docker_container(docker, container)
     try:
+        first_source = next(iter(artifacts))
         run_checked(
-            ["docker", "create", "--name", container, image, source],
+            [docker, "create", "--name", container, image, first_source],
             cwd=SCRIPT_DIR,
         )
-        run_checked(
-            ["docker", "cp", f"{container}:{source}", destination],
-            cwd=SCRIPT_DIR,
-        )
+        for source, destination in artifacts.items():
+            run_checked(
+                [docker, "cp", f"{container}:{source}", destination],
+                cwd=SCRIPT_DIR,
+            )
     finally:
-        remove_docker_container(container)
-    require_file(destination)
+        remove_docker_container(docker, container)
+    for destination in artifacts.values():
+        require_file(destination)
+
+
+def hyperlight_artifact_cache_dir(image: str) -> Path:
+    image_key = hashlib.sha256(image.encode("utf-8")).hexdigest()
+    return HYPERLIGHT_ARTIFACT_CACHE_DIR / image_key
+
+
+def cached_hyperlight_artifacts(image: str) -> tuple[Path, Path] | None:
+    cache = hyperlight_artifact_cache_dir(image)
+    kernel = cache / "kernel"
+    initrd = cache / "initrd.cpio"
+    config_path = cache / "artifact-config.json"
+    if not kernel.is_file() or not initrd.is_file() or not config_path.is_file():
+        return None
+    try:
+        config: object = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    expected = {
+        "format": HYPERLIGHT_ARTIFACT_CACHE_FORMAT,
+        "image": image,
+        "kernel_sha256": sha256(kernel),
+        "initrd_sha256": sha256(initrd),
+    }
+    return (kernel, initrd) if config == expected else None
+
+
+def cache_hyperlight_artifacts(
+    image: str,
+    kernel: Path,
+    initrd: Path,
+) -> tuple[Path, Path]:
+    cache = hyperlight_artifact_cache_dir(image)
+    cache.mkdir(parents=True, exist_ok=True)
+    cached_kernel = cache / "kernel"
+    cached_initrd = cache / "initrd.cpio"
+    shutil.copyfile(require_file(kernel), cached_kernel)
+    shutil.copyfile(require_file(initrd), cached_initrd)
+    config = {
+        "format": HYPERLIGHT_ARTIFACT_CACHE_FORMAT,
+        "image": image,
+        "kernel_sha256": sha256(cached_kernel),
+        "initrd_sha256": sha256(cached_initrd),
+    }
+    (cache / "artifact-config.json").write_text(
+        json.dumps(config, indent=2),
+        encoding="utf-8",
+    )
+    return cached_kernel, cached_initrd
+
+
+def stage_hyperlight_artifacts(
+    image: str,
+    kernel: Path,
+    initrd: Path,
+    *,
+    use_docker: bool,
+) -> str:
+    if kernel.is_file() and initrd.is_file():
+        return "existing output"
+
+    cached = cached_hyperlight_artifacts(image)
+    acquisition = "persistent cache"
+    if cached is None:
+        HYPERLIGHT_ARTIFACT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="hyperlight-artifacts-",
+            dir=HYPERLIGHT_ARTIFACT_CACHE_DIR,
+        ) as temporary_dir:
+            temporary = Path(temporary_dir)
+            extracted_kernel = temporary / "kernel"
+            extracted_initrd = temporary / "initrd.cpio"
+            extracted = {
+                "/kernel": extracted_kernel,
+                "/initrd.cpio": extracted_initrd,
+            }
+            if use_docker:
+                extract_docker_artifacts(
+                    require_command("docker"),
+                    image,
+                    extracted,
+                )
+                acquisition = "Docker image"
+            else:
+                extract_oci_artifacts(image, extracted)
+                acquisition = "OCI registry"
+            cached = cache_hyperlight_artifacts(
+                image,
+                extracted_kernel,
+                extracted_initrd,
+            )
+
+    cached_kernel, cached_initrd = cached
+    kernel.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(cached_kernel, kernel)
+    shutil.copyfile(cached_initrd, initrd)
+    return acquisition
 
 
 def stage_sample(
@@ -581,8 +979,15 @@ def nvx_build_provenance() -> dict[str, str]:
     }
 
 
-def build_projects(selected: set[str]) -> None:
-    require_command("docker")
+def build_projects(selected: set[str], *, use_docker: bool = False) -> None:
+    docker_builds = selected.intersection({"nvx", "nanvix"})
+    if docker_builds and not use_docker:
+        targets = ", ".join(sorted(docker_builds))
+        raise RuntimeError(
+            f"--build for {targets} requires Docker; rerun with --use-docker"
+        )
+    if docker_builds:
+        require_command("docker")
     if selected.intersection({"nvx", "hyperlight"}):
         require_command("cargo")
 
@@ -827,6 +1232,8 @@ def prepare(
     selected: set[str],
     timeout: float,
     workload: str,
+    *,
+    use_docker: bool = False,
 ) -> dict[tuple[str, str], CommandSpec]:
     artifacts = output_dir / "artifacts"
     artifacts.mkdir(parents=True, exist_ok=True)
@@ -1502,7 +1909,6 @@ def prepare(
             HYPERLIGHT_RUNNER_DIR / "target" / "release" / "vmm-hyperlight-runner.exe"
         )
 
-        # Pull workload-specific kernel/initrd from GHCR
         hl_image = HYPERLIGHT_WORKLOAD_IMAGE[workload]
         hl_kernel = hyperlight_work / "kernel"
         hl_initrd = hyperlight_work / "initrd.cpio"
@@ -1510,11 +1916,15 @@ def prepare(
         hl_heap = memory["hyperlight"]
         hl_app_args = HYPERLIGHT_APP_ARGS.get(workload, ())
 
-        if not hl_kernel.is_file() or not hl_initrd.is_file():
-            extract_docker_artifact(hl_image, "/kernel", hl_kernel)
-            extract_docker_artifact(hl_image, "/initrd.cpio", hl_initrd)
+        artifact_acquisition = stage_hyperlight_artifacts(
+            hl_image,
+            hl_kernel,
+            hl_initrd,
+            use_docker=use_docker,
+        )
         hyperlight_artifact_provenance = {
             "image": hl_image,
+            "acquisition": artifact_acquisition,
             "kernel_sha256": sha256(hl_kernel),
             "initrd_sha256": sha256(hl_initrd),
             "runner_sha256": sha256(runner),
@@ -2071,6 +2481,8 @@ def write_metadata(
     output_dir: Path,
     specs: dict[tuple[str, str], CommandSpec],
     workload: str,
+    *,
+    use_docker: bool = False,
 ) -> None:
     active_vmms = {spec.vmm for spec in specs.values()}
     included_vmms = set(active_vmms)
@@ -2212,8 +2624,13 @@ def write_metadata(
         "tools": {
             "cargo": version_output(["cargo", "--version"]),
             "rustc": version_output(["rustc", "--version"]),
-            "docker": version_output(["docker", "--version"]),
+            "docker": (
+                version_output(["docker", "--version"])
+                if use_docker
+                else "disabled"
+            ),
         },
+        "configuration": {"use_docker": use_docker},
         "repositories": {
             "vmm-benchmarks": git_metadata(SCRIPT_DIR),
             "nvx": git_metadata(NVX_DIR),
@@ -3764,6 +4181,14 @@ def parse_args() -> argparse.Namespace:
         help="build all selected targets using their checked-out branch instructions",
     )
     parser.add_argument(
+        "--use-docker",
+        action="store_true",
+        help=(
+            "allow Docker-backed builds and use Docker for uncached Hyperlight "
+            "workload artifacts instead of the OCI registry API"
+        ),
+    )
+    parser.add_argument(
         "--prepare-only",
         action="store_true",
         help="prepare reusable snapshots, then stop before sampling",
@@ -3839,14 +4264,20 @@ def main() -> int:
         return 0
 
     if args.build:
-        build_projects(selected)
+        build_projects(selected, use_docker=args.use_docker)
     specs = prepare(
         output_dir,
         selected,
         args.timeout,
         args.workload,
+        use_docker=args.use_docker,
     )
-    write_metadata(output_dir, specs, args.workload)
+    write_metadata(
+        output_dir,
+        specs,
+        args.workload,
+        use_docker=args.use_docker,
+    )
     if args.prepare_only:
         print(f"Prepared artifacts in {output_dir}")
         return 0

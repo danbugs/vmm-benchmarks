@@ -69,7 +69,7 @@ controls persisted-resume, runtime-preinitialized, and warm-reuse samples.
 
 - Windows with WHP enabled
 - Git for Windows
-- Docker running
+- Docker running only when using `--use-docker`
 - Microsoft Edge (used for SVG-to-PNG rendering)
 - Python 3.12+ with pip
 - Rust/Cargo 1.89+
@@ -103,22 +103,26 @@ patch or image provenance to the generated VMM, kernel, and guest artifact
 hashes. Snapshot preparation rejects missing or stale receipts instead of
 silently labeling an old artifact with the current methodology.
 
-Hyperlight needs no source patch. The harness pulls each workload's kernel and
-initrd from its configured GHCR image before invoking the root-owned runner.
+Hyperlight needs no source patch. By default, the harness retrieves each
+workload's kernel and initrd directly through GHCR's OCI registry API, verifies
+the manifest and layer SHA-256 digests, and stores the files in the ignored
+`.build-artifacts/hyperlight/` cache. With `--use-docker`, a missing cache entry
+is extracted with Docker instead. Later result directories reuse the validated
+cache without invoking either transport.
 
 ## Reproduce
 
 From the repository root:
 
 ```powershell
-python .\benchmark.py --build --samples 100
+python .\benchmark.py --build --use-docker --samples 100
 ```
 
 To build and run one NVX snapshot-generation sample plus 100 resume/warm
 Markdown-to-DOCX samples:
 
 ```powershell
-python .\benchmark.py --build --workload pandoc-docx --samples 100 --output .\results\nvx-pandoc-docx
+python .\benchmark.py --build --use-docker --workload pandoc-docx --samples 100 --output .\results\nvx-pandoc-docx
 ```
 
 `pandoc-docx` supports only NVX; selecting Nanvix or Hyperlight for that
@@ -127,20 +131,27 @@ workload is rejected before building.
 To compare NVX and Hyperlight on native Pandoc or Node.js:
 
 ```powershell
-python .\benchmark.py --build --workload pandoc-native --samples 100 --output .\results\pandoc-native
-python .\benchmark.py --build --workload nodejs-hello --samples 100 --output .\results\nodejs-hello
+python .\benchmark.py --build --use-docker --workload pandoc-native --samples 100 --output .\results\pandoc-native
+python .\benchmark.py --build --use-docker --workload nodejs-hello --samples 100 --output .\results\nodejs-hello
 ```
 
 To run every NVX/Hyperlight workload with one snapshot-generation sample and
 100 samples per other available mode:
 
 ```powershell
-python .\benchmark.py --build --workload hello --vmm nvx --vmm hyperlight --samples 100 --output .\results\all-hello
+python .\benchmark.py --build --use-docker --workload hello --vmm nvx --vmm hyperlight --samples 100 --output .\results\all-hello
 python .\benchmark.py --workload pandoc-docx-stdlib --vmm nvx --vmm hyperlight --samples 100 --output .\results\all-pandoc-docx-stdlib
 python .\benchmark.py --workload pandoc-docx --vmm nvx --samples 100 --output .\results\all-pandoc-docx
 python .\benchmark.py --workload pandoc-native --vmm nvx --vmm hyperlight --samples 100 --output .\results\all-pandoc-native
 python .\benchmark.py --workload nodejs-hello --vmm nvx --vmm hyperlight --samples 100 --output .\results\all-nodejs-hello
 ```
+
+Docker is disabled unless `--use-docker` is present. NVX and Nanvix builds are
+Docker-backed, so combine `--build --use-docker` for those targets. Hyperlight's
+runner build and default OCI artifact retrieval are Docker-free; `--use-docker`
+selects Docker instead of the OCI API when a workload cache entry is missing.
+Once build receipts exist, omit both flags to build snapshots and benchmark
+without launching Docker.
 
 `--build` builds each selected runtime and VMM using its documented Windows
 flow plus the temporary benchmark patches described above. Omit it to reuse
