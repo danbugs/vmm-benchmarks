@@ -14,7 +14,6 @@ use hyperlight_host::{
     GuestBinary, HostFunctions, MultiUseSandbox, UninitializedSandbox,
     func::Registerable,
     sandbox::{SandboxConfiguration, snapshot::{OciTag, Snapshot}},
-    sandbox::uninitialized::GuestEnvironment,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -29,35 +28,6 @@ const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
 const DEFAULT_SCRATCH_MB: usize = 256;
 const HEAP_SIZE: u64 = 0x10_0000; // 1 MiB
 const SNAPSHOT_TAG: &str = "latest";
-
-// TLV magic headers for init_data — must match the Unikraft platform code.
-const CMDLINE_MAGIC: &[u8; 8] = b"HLCMDLN\0";
-const WALLTIME_MAGIC: &[u8; 8] = b"HLWALL0\0";
-
-/// Build an init_data blob containing the cmdline TLV and wall-clock TLV.
-/// The Unikraft guest reads these at boot to set the command line and
-/// initialize the wall clock (so `time.localtime()` returns the right date).
-fn build_init_data(cmdline: &str) -> Vec<u8> {
-    let mut buf = Vec::new();
-
-    // HLCMDLN TLV
-    let cmdline_bytes = cmdline.as_bytes();
-    buf.extend_from_slice(CMDLINE_MAGIC);
-    buf.extend_from_slice(&(cmdline_bytes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(cmdline_bytes);
-    buf.push(0);
-
-    // HLWALL0 TLV — host wall time so the guest has a sensible epoch
-    let wall_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    buf.extend_from_slice(WALLTIME_MAGIC);
-    buf.extend_from_slice(&8u32.to_le_bytes());
-    buf.extend_from_slice(&wall_ns.to_le_bytes());
-
-    buf
-}
 
 // ── Host functions ──────────────────────────────────────────────────────
 
@@ -97,6 +67,13 @@ fn find_cpio_entry(path: &Path) -> Option<String> {
     None
 }
 
+fn wall_clock_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 fn register_host_functions(
     sandbox: &mut UninitializedSandbox,
     cmdline: &str,
@@ -114,6 +91,7 @@ fn register_host_functions(
     sandbox.register("GetInitrdSize", move || -> hyperlight_host::Result<u64> { Ok(initrd_size) })?;
     let est = exn_stack_top();
     sandbox.register("GetExnStackTop", move || -> hyperlight_host::Result<u64> { Ok(est) })?;
+    sandbox.register("GetWallClockNs", move || -> hyperlight_host::Result<u64> { Ok(wall_clock_ns()) })?;
     Ok(())
 }
 
@@ -124,6 +102,7 @@ fn build_host_functions() -> Result<HostFunctions> {
     hf.register_host_function("GetInitrdBase", || -> hyperlight_host::Result<u64> { Ok(0) })?;
     hf.register_host_function("GetInitrdSize", || -> hyperlight_host::Result<u64> { Ok(0) })?;
     hf.register_host_function("GetExnStackTop", || -> hyperlight_host::Result<u64> { Ok(exn_stack_top()) })?;
+    hf.register_host_function("GetWallClockNs", || -> hyperlight_host::Result<u64> { Ok(wall_clock_ns()) })?;
     Ok(hf)
 }
 
@@ -141,18 +120,18 @@ fn evolve_sandbox(initrd: &Path, scratch_mb: usize) -> Result<MultiUseSandbox> {
     cfg.set_scratch_size(scratch_size);
     cfg.set_heap_size(HEAP_SIZE);
 
+    let mut usandbox = UninitializedSandbox::new(
+        GuestBinary::Buffer(KERNEL),
+        Some(cfg),
+    )?;
+
+    let initrd_size = usandbox.map_file_cow(initrd, INITRD_MAP_BASE)?;
     let entry = find_cpio_entry(initrd).unwrap_or_default();
     let cmdline = if entry.is_empty() {
         "unikraft-hyperlight".to_string()
     } else {
         format!("unikraft-hyperlight {entry}")
     };
-
-    let init_data = build_init_data(&cmdline);
-    let env = GuestEnvironment::new(GuestBinary::Buffer(KERNEL), Some(&init_data));
-    let mut usandbox = UninitializedSandbox::new(env, Some(cfg))?;
-
-    let initrd_size = usandbox.map_file_cow(initrd, INITRD_MAP_BASE)?;
 
     register_host_functions(&mut usandbox, &cmdline, scratch_size, INITRD_MAP_BASE, initrd_size)?;
     let sandbox = usandbox.evolve()?;
@@ -186,19 +165,19 @@ fn snapshot_generation(initrd: &Path, snapshot_dir: &Path, scratch_mb: usize, wa
     cfg.set_scratch_size(scratch_size);
     cfg.set_heap_size(HEAP_SIZE);
 
+    let t0 = Instant::now();
+    let mut usandbox = UninitializedSandbox::new(
+        GuestBinary::Buffer(KERNEL),
+        Some(cfg),
+    )?;
+
+    let initrd_size = usandbox.map_file_cow(initrd, INITRD_MAP_BASE)?;
     let entry = find_cpio_entry(initrd).unwrap_or_default();
     let cmdline = if entry.is_empty() {
         "unikraft-hyperlight".to_string()
     } else {
         format!("unikraft-hyperlight {entry}")
     };
-
-    let t0 = Instant::now();
-    let init_data = build_init_data(&cmdline);
-    let env = GuestEnvironment::new(GuestBinary::Buffer(KERNEL), Some(&init_data));
-    let mut usandbox = UninitializedSandbox::new(env, Some(cfg))?;
-
-    let initrd_size = usandbox.map_file_cow(initrd, INITRD_MAP_BASE)?;
     register_host_functions(&mut usandbox, &cmdline, scratch_size, INITRD_MAP_BASE, initrd_size)?;
     let mut sandbox = usandbox.evolve()?;
     if warmup {
