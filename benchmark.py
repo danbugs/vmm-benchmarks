@@ -107,6 +107,10 @@ NVX_PYTHON_WORKLOADS = {"hello", "pandoc-docx-stdlib", "pandoc-docx"}
 NVX_MOUNTED_EXEC_WORKLOADS = {"pandoc-native", "nodejs-hello"}
 HL_UK_MINI_PYTHON_INITRD = HL_UK_MINI_RUNNER_DIR / "python-rootfs.cpio"
 HL_UK_MINI_NODE_INITRD = HL_UK_MINI_RUNNER_DIR / "node-rootfs.cpio"
+HL_UK_MINI_INITRD_IMAGES: dict[str, tuple[str, Path]] = {
+    "python": ("ghcr.io/danbugs/hl-uk-mini/python-rootfs:latest", HL_UK_MINI_PYTHON_INITRD),
+    "node": ("ghcr.io/danbugs/hl-uk-mini/node-rootfs:latest", HL_UK_MINI_NODE_INITRD),
+}
 HL_UK_MINI_SNAPSHOT_FORMAT = 1
 
 VMM_ORDER = ("nvx", "nanvix", "hyperlight", "hl-uk-mini")
@@ -195,7 +199,7 @@ GUEST_MEMORY_MIB: dict[str, dict[str, int]] = {
     "nodejs-hello": {
         "nvx": 1536,
         "hyperlight": 512,
-        "hl-uk-mini": 512,
+        "hl-uk-mini": 448,
     },
     "nodejs-compile-test": {
         "hyperlight": 512,
@@ -909,6 +913,65 @@ def stage_hyperlight_artifacts(
     shutil.copyfile(cached_kernel, kernel)
     shutil.copyfile(cached_initrd, initrd)
     return acquisition
+
+
+def pull_oci_artifact(image_ref: str, dest: Path) -> Path:
+    """Pull a single-layer OCI artifact from GHCR without Docker.
+
+    Uses the OCI Distribution API directly:
+      1. Get an anonymous bearer token
+      2. Fetch the manifest to find the layer digest
+      3. Download the layer blob to dest
+    """
+    import urllib.request
+
+    # Parse "ghcr.io/owner/repo:tag"
+    ref = image_ref.removeprefix("ghcr.io/")
+    name, _, tag = ref.rpartition(":")
+    if not tag:
+        tag = "latest"
+
+    base = "https://ghcr.io/v2"
+    token_url = (
+        f"https://ghcr.io/token?scope=repository:{name}:pull&service=ghcr.io"
+    )
+    with urllib.request.urlopen(token_url) as resp:
+        bearer = json.loads(resp.read())["token"]
+
+    headers = {
+        "Authorization": f"Bearer {bearer}",
+        "Accept": "application/vnd.oci.image.manifest.v1+json",
+    }
+
+    # Fetch manifest
+    manifest_url = f"{base}/{name}/manifests/{tag}"
+    req = urllib.request.Request(manifest_url, headers=headers)
+    with urllib.request.urlopen(req) as resp:
+        manifest = json.loads(resp.read())
+
+    layers = manifest.get("layers", [])
+    if not layers:
+        raise RuntimeError(f"No layers in manifest for {image_ref}")
+    digest = layers[0]["digest"]
+
+    # Download blob
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    blob_url = f"{base}/{name}/blobs/{digest}"
+    req = urllib.request.Request(blob_url, headers={"Authorization": f"Bearer {bearer}"})
+    print(f"+ Pulling {image_ref} -> {dest}", flush=True)
+    with urllib.request.urlopen(req) as resp:
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(resp, f)
+    return dest
+
+
+def ensure_hl_uk_mini_initrd(workload: str) -> Path:
+    """Return the local initrd path for hl-uk-mini, pulling from GHCR if missing."""
+    key = "python" if workload in HYPERLIGHT_PYHL_WORKLOADS else "node"
+    image_ref, local_path = HL_UK_MINI_INITRD_IMAGES[key]
+    if not local_path.is_file():
+        pull_oci_artifact(image_ref, local_path)
+    return require_file(local_path)
 
 
 def stage_sample(
@@ -2071,10 +2134,7 @@ def prepare(
         mini_runner = require_file(
             HL_UK_MINI_RUNNER_DIR / "target" / "release" / "hl-uk-mini-runner.exe"
         )
-        if workload in HYPERLIGHT_PYHL_WORKLOADS:
-            mini_initrd = require_file(HL_UK_MINI_PYTHON_INITRD)
-        else:
-            mini_initrd = require_file(HL_UK_MINI_NODE_INITRD)
+        mini_initrd = ensure_hl_uk_mini_initrd(workload)
         mini_scratch = memory["hl-uk-mini"]
 
         # Snapshot validity check
@@ -2259,6 +2319,7 @@ def prepare(
         delivery["hl-uk-mini"] = {"method": "function_call", "function": "Exec"}
     else:
         delivery["hyperlight"] = {"method": "embedded_in_initrd"}
+        delivery["hl-uk-mini"] = {"method": "embedded_in_initrd"}
     previous_snapshot_policy_value = previous_manifest.get("snapshot_policy")
     previous_snapshot_policy = (
         cast(dict[str, object], previous_snapshot_policy_value)
