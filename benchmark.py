@@ -41,6 +41,7 @@ NVX_DIR = SCRIPT_DIR / "nvx"
 NANVIX_DIR = SCRIPT_DIR / "nanvix-python"
 HYPERLIGHT_DIR = SCRIPT_DIR / "hyperlight-unikraft"
 HYPERLIGHT_RUNNER_DIR = SCRIPT_DIR / "hyperlight-runner"
+HL_UK_MINI_RUNNER_DIR = SCRIPT_DIR / "hl-uk-mini-runner"
 PATCHES_DIR = SCRIPT_DIR / "patches"
 BUILD_RECEIPTS_DIR = SCRIPT_DIR / ".build-receipts"
 BUILD_ARTIFACTS_DIR = SCRIPT_DIR / ".build-artifacts"
@@ -104,18 +105,23 @@ HYPERLIGHT_EMBEDDED_MARKERS = {
 HYPERLIGHT_PYHL_WORKLOADS = {"hello", "pandoc-docx-stdlib"}
 NVX_PYTHON_WORKLOADS = {"hello", "pandoc-docx-stdlib", "pandoc-docx"}
 NVX_MOUNTED_EXEC_WORKLOADS = {"pandoc-native", "nodejs-hello"}
+HL_UK_MINI_PYTHON_INITRD = HL_UK_MINI_RUNNER_DIR / "python-rootfs.cpio"
+HL_UK_MINI_NODE_INITRD = HL_UK_MINI_RUNNER_DIR / "node-rootfs.cpio"
+HL_UK_MINI_SNAPSHOT_FORMAT = 1
 
-VMM_ORDER = ("nvx", "nanvix", "hyperlight")
+VMM_ORDER = ("nvx", "nanvix", "hyperlight", "hl-uk-mini")
 VMM_LABELS = {
     "nvx": "NVX (OpenVMM + Linux)",
     "nanvix": "Nanvix (OpenVMM + Nanvix)",
     "hyperlight": "Hyperlight (Hyperlight + Unikraft)",
+    "hl-uk-mini": "HL-UK-Mini (Hyperlight + elfloader)",
 }
 VMM_PLOT_LABELS = dict(VMM_LABELS)
 VMM_PLOT_COLORS = {
     "nvx": "#2563eb",
     "nanvix": "#16a34a",
     "hyperlight": "#dc2626",
+    "hl-uk-mini": "#f59e0b",
 }
 WORKLOAD_ORDER = ("hello", "pandoc-docx-stdlib", "pandoc-docx", "pandoc-native", "nodejs-hello", "nodejs-compile-test")
 WORKLOAD_LABELS = {
@@ -136,10 +142,10 @@ WORKLOAD_TITLES = {
 }
 WORKLOAD_VMMS: dict[str, tuple[str, ...]] = {
     "hello": VMM_ORDER,
-    "pandoc-docx-stdlib": ("nvx", "hyperlight"),
+    "pandoc-docx-stdlib": ("nvx", "hyperlight", "hl-uk-mini"),
     "pandoc-docx": ("nvx",),
     "pandoc-native": ("nvx", "hyperlight"),
-    "nodejs-hello": ("nvx", "hyperlight"),
+    "nodejs-hello": ("nvx", "hyperlight", "hl-uk-mini"),
     "nodejs-compile-test": ("hyperlight",),
 }
 WORKLOAD_SAMPLES: dict[str, Path | None] = {
@@ -152,7 +158,7 @@ WORKLOAD_SAMPLES: dict[str, Path | None] = {
 }
 WORKLOAD_SAMPLE_VMMS: dict[str, tuple[str, ...]] = {
     "hello": VMM_ORDER,
-    "pandoc-docx-stdlib": ("nvx", "hyperlight"),
+    "pandoc-docx-stdlib": ("nvx", "hyperlight", "hl-uk-mini"),
     "pandoc-docx": ("nvx",),
     "pandoc-native": ("nvx",),
     "nodejs-hello": ("nvx",),
@@ -166,16 +172,18 @@ WORKLOAD_MARKERS = {
     "nodejs-hello": "hello",
     "nodejs-compile-test": "NODE_TEST_OK",
 }
-RSS_VMM_ORDER = ("nanvix", "nvx", "hyperlight")
+RSS_VMM_ORDER = ("nanvix", "nvx", "hyperlight", "hl-uk-mini")
 GUEST_MEMORY_MIB: dict[str, dict[str, int]] = {
     "hello": {
         "nvx": 1536,
         "nanvix": 256,
         "hyperlight": 2560,
+        "hl-uk-mini": 256,
     },
     "pandoc-docx-stdlib": {
         "nvx": 1536,
         "hyperlight": 2560,
+        "hl-uk-mini": 256,
     },
     "pandoc-docx": {
         "nvx": 1536,
@@ -187,6 +195,7 @@ GUEST_MEMORY_MIB: dict[str, dict[str, int]] = {
     "nodejs-hello": {
         "nvx": 1536,
         "hyperlight": 512,
+        "hl-uk-mini": 512,
     },
     "nodejs-compile-test": {
         "hyperlight": 512,
@@ -1000,7 +1009,7 @@ def build_projects(selected: set[str], *, use_docker: bool = False) -> None:
         )
     if docker_builds:
         require_command("docker")
-    if selected.intersection({"nvx", "hyperlight"}):
+    if selected.intersection({"nvx", "hyperlight", "hl-uk-mini"}):
         require_command("cargo")
 
     if "nvx" in selected:
@@ -1082,6 +1091,10 @@ def build_projects(selected: set[str], *, use_docker: bool = False) -> None:
     if "hyperlight" in selected:
         (BUILD_RECEIPTS_DIR / "hyperlight.json").unlink(missing_ok=True)
         run_checked(["cargo", "build", "--release"], cwd=HYPERLIGHT_RUNNER_DIR)
+
+    if "hl-uk-mini" in selected:
+        (BUILD_RECEIPTS_DIR / "hl-uk-mini.json").unlink(missing_ok=True)
+        run_checked(["cargo", "build", "--release"], cwd=HL_UK_MINI_RUNNER_DIR)
 
 
 def run_control(
@@ -2050,6 +2063,122 @@ def prepare(
             "BENCHMARK_OK",
         )
 
+    if "hl-uk-mini" in selected:
+        mini_work = artifacts / "hl-uk-mini"
+        mini_snapshot = mini_work / "snapshot"
+        mini_generation_snapshot = mini_work / "snapshot-generation"
+        mini_work.mkdir(parents=True, exist_ok=True)
+        mini_runner = require_file(
+            HL_UK_MINI_RUNNER_DIR / "target" / "release" / "hl-uk-mini-runner.exe"
+        )
+        if workload in HYPERLIGHT_PYHL_WORKLOADS:
+            mini_initrd = require_file(HL_UK_MINI_PYTHON_INITRD)
+        else:
+            mini_initrd = require_file(HL_UK_MINI_NODE_INITRD)
+        mini_scratch = memory["hl-uk-mini"]
+
+        # Snapshot validity check
+        mini_snapshot_config_path = mini_snapshot / "benchmark-config.json"
+        mini_warmup = workload in HYPERLIGHT_PYHL_WORKLOADS
+        expected_mini_config: dict[str, object] = {
+            "format": HL_UK_MINI_SNAPSHOT_FORMAT,
+            "runner_sha256": sha256(mini_runner),
+            "initrd_sha256": sha256(mini_initrd),
+            "scratch_mb": mini_scratch,
+            "warmup": mini_warmup,
+        }
+        mini_snapshot_config: object = None
+        if mini_snapshot_config_path.is_file():
+            mini_snapshot_config = json.loads(
+                mini_snapshot_config_path.read_text(encoding="utf-8")
+            )
+        mini_snapshot_matches = (
+            (mini_snapshot / "index.json").is_file()
+            and mini_snapshot_config == expected_mini_config
+        )
+        if not mini_snapshot_matches:
+            if (output_dir / "raw.csv").is_file() and "hl-uk-mini" in previous_vmms:
+                raise RuntimeError(
+                    "hl-uk-mini snapshot does not match the current configuration "
+                    f"in {output_dir}; choose a new --output directory"
+                )
+            shutil.rmtree(mini_snapshot, ignore_errors=True)
+            mini_capture_cmd: list[str | Path] = [
+                mini_runner, "capture",
+                str(mini_initrd), str(mini_snapshot),
+                "--scratch-mb", str(mini_scratch),
+            ]
+            if workload in HYPERLIGHT_PYHL_WORKLOADS:
+                mini_capture_cmd.append("--warmup")
+            run_control(
+                mini_capture_cmd,
+                cwd=HL_UK_MINI_RUNNER_DIR,
+                timeout=timeout,
+                marker="SNAPSHOT_OK",
+            )
+            mini_snapshot_config_path.write_text(
+                json.dumps(expected_mini_config, indent=2),
+                encoding="utf-8",
+            )
+        require_file(mini_snapshot / "index.json")
+
+        mini_gen_args: list[str] = [
+            "snapshot-generation",
+            str(mini_initrd),
+            str(mini_generation_snapshot),
+            "--scratch-mb",
+            str(mini_scratch),
+        ]
+        if workload in HYPERLIGHT_PYHL_WORKLOADS:
+            mini_gen_args.append("--warmup")
+        specs[("hl-uk-mini", "snapshot-generation")] = CommandSpec(
+            "hl-uk-mini",
+            "snapshot-generation",
+            mini_runner,
+            tuple(mini_gen_args),
+            HL_UK_MINI_RUNNER_DIR,
+            "BENCHMARK_OK",
+            reset_path=mini_generation_snapshot,
+            success_paths=(mini_generation_snapshot / "index.json",),
+        )
+        if workload in HYPERLIGHT_PYHL_WORKLOADS:
+            assert sample is not None
+            mini_restore_args = (
+                "restore", str(mini_snapshot), str(sample),
+                "--initrd", str(mini_initrd),
+            )
+            mini_warm_args = (
+                "warm", str(mini_snapshot), str(sample),
+                "--initrd", str(mini_initrd),
+            )
+        else:
+            # Non-script workloads (Node.js): no sample, runner calls
+            # call("run", ()) to dispatch the app to completion.
+            mini_restore_args = (
+                "restore", str(mini_snapshot),
+                "--initrd", str(mini_initrd),
+            )
+            mini_warm_args = (
+                "warm", str(mini_snapshot),
+                "--initrd", str(mini_initrd),
+            )
+        specs[("hl-uk-mini", "restore")] = CommandSpec(
+            "hl-uk-mini",
+            "restore",
+            mini_runner,
+            mini_restore_args,
+            HL_UK_MINI_RUNNER_DIR,
+            "BENCHMARK_OK",
+        )
+        specs[("hl-uk-mini", "warm")] = CommandSpec(
+            "hl-uk-mini",
+            "warm",
+            mini_runner,
+            mini_warm_args,
+            HL_UK_MINI_RUNNER_DIR,
+            "BENCHMARK_OK",
+        )
+
     previous_commands = previous_manifest.get("commands", {})
     commands = (
         {
@@ -2127,6 +2256,7 @@ def prepare(
         }
     if workload in HYPERLIGHT_PYHL_WORKLOADS:
         delivery["hyperlight"] = {"method": "function_call", "function": "run"}
+        delivery["hl-uk-mini"] = {"method": "function_call", "function": "Exec"}
     else:
         delivery["hyperlight"] = {"method": "embedded_in_initrd"}
     previous_snapshot_policy_value = previous_manifest.get("snapshot_policy")
@@ -2190,6 +2320,8 @@ def prepare(
             if workload in HYPERLIGHT_PYHL_WORKLOADS
             else "initialized_unikraft_elfloader"
         )
+    if "hl-uk-mini" in selected:
+        capture_points["hl-uk-mini"] = "initialized_cpython_elfloader"
     missing_capture_points = manifest_vmms - capture_points.keys()
     if missing_capture_points:
         missing = ", ".join(sorted(missing_capture_points))
@@ -2313,6 +2445,12 @@ def prepare(
     if "hyperlight" in selected:
         warmup_by_vmm["hyperlight"] = (
             GENERIC_SNAPSHOT_WARMUP
+            if workload in HYPERLIGHT_PYHL_WORKLOADS
+            else None
+        )
+    if "hl-uk-mini" in selected:
+        warmup_by_vmm["hl-uk-mini"] = (
+            "import re, xml.etree.ElementTree, zipfile, io, pathlib; pass"
             if workload in HYPERLIGHT_PYHL_WORKLOADS
             else None
         )
@@ -2577,6 +2715,20 @@ def write_metadata(
             / "target"
             / "release"
             / "vmm-hyperlight-runner.exe"
+        )
+    if "hl-uk-mini" in included_vmms:
+        supported_source_paths.add(
+            HL_UK_MINI_RUNNER_DIR
+            / "target"
+            / "release"
+            / "hl-uk-mini-runner.exe"
+        )
+    if "hl-uk-mini" in active_vmms:
+        refreshed_source_paths.add(
+            HL_UK_MINI_RUNNER_DIR
+            / "target"
+            / "release"
+            / "hl-uk-mini-runner.exe"
         )
     artifact_paths.update(path for path in refreshed_source_paths if path.is_file())
     if workload == "nodejs-hello" and "nvx" in included_vmms:
@@ -3849,6 +4001,11 @@ def write_report(
                     "- Hyperlight snapshots its initialized workload image and invokes the "
                     "image entry point after restore."
                 )
+        if "hl-uk-mini" in included_vmms:
+            snapshot_method_lines.append(
+                "- HL-UK-Mini snapshots an initialized CPython elfloader (no warmup), "
+                "then passes the sample source to its `Exec` function after restore."
+            )
     else:
         snapshot_method_lines = [
             "- This result predates explicit snapshot-policy metadata; generic warmup and "
@@ -3911,6 +4068,10 @@ def write_report(
     if "hyperlight" in included_vmms:
         warm_details.append(
             "Hyperlight rewinds the in-memory sandbox between calls."
+        )
+    if "hl-uk-mini" in included_vmms:
+        warm_details.append(
+            "HL-UK-Mini rewinds the in-memory sandbox between calls."
         )
     if "nvx" in included_vmms and workload in NVX_PYTHON_WORKLOADS:
         warm_details.append(
