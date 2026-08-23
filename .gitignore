@@ -4,4 +4,6 @@ __pycache__/
 /.build-receipts/
 /.build-artifacts/
 /hyperlight-runner/target/
+/hl-uk-mini-runner/target/
+/hl-uk-mini-runner/*.cpio
 /results/

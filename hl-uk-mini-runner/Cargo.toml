@@ -1,0 +1,8 @@
+[package]
+name = "hl-uk-mini-runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyperlight-common = "0.16.0"
+hyperlight-host = "0.16.0"
