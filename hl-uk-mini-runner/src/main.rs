@@ -206,18 +206,13 @@ fn snapshot_generation(initrd: &Path, snapshot_dir: &Path, scratch_mb: usize, wa
     Ok(())
 }
 
-fn restore(snapshot_dir: &Path, initrd: Option<&Path>, script: Option<&Path>) -> Result<()> {
+fn restore(snapshot_dir: &Path, _initrd: Option<&Path>, script: Option<&Path>) -> Result<()> {
     let tag: OciTag = SNAPSHOT_TAG.parse()?;
 
     let t0 = Instant::now();
     let snap: Arc<Snapshot> = Arc::new(Snapshot::load(snapshot_dir, tag)?);
     let hf = build_host_functions()?;
     let mut sandbox = MultiUseSandbox::from_snapshot(snap, hf, None)?;
-    // Re-map initrd so demand-paged pages not faulted during capture
-    // can still be resolved after restore.
-    if let Some(initrd_path) = initrd {
-        sandbox.map_file_cow(initrd_path, INITRD_MAP_BASE)?;
-    }
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let t1 = Instant::now();
@@ -239,7 +234,7 @@ fn restore(snapshot_dir: &Path, initrd: Option<&Path>, script: Option<&Path>) ->
     Ok(())
 }
 
-fn warm(snapshot_dir: &Path, initrd: Option<&Path>, script: Option<&Path>, iterations: usize) -> Result<()> {
+fn warm(snapshot_dir: &Path, _initrd: Option<&Path>, script: Option<&Path>, iterations: usize) -> Result<()> {
     let tag: OciTag = SNAPSHOT_TAG.parse()?;
 
     let source = script.map(fs::read_to_string).transpose()?;
@@ -248,9 +243,6 @@ fn warm(snapshot_dir: &Path, initrd: Option<&Path>, script: Option<&Path>, itera
     let snap: Arc<Snapshot> = Arc::new(Snapshot::load(snapshot_dir, tag)?);
     let hf = build_host_functions()?;
     let mut sandbox = MultiUseSandbox::from_snapshot(snap.clone(), hf, None)?;
-    if let Some(initrd_path) = initrd {
-        sandbox.map_file_cow(initrd_path, INITRD_MAP_BASE)?;
-    }
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!("BENCHMARK_PHASE snapshot_load_ms={load_ms:.6}");
 
