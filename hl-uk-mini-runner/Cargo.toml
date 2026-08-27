@@ -4,5 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hyperlight-common = { git = "https://github.com/danbugs/hyperlight.git", branch = "danbugs/fix-restore-rss-v0.16" }
-hyperlight-host = { git = "https://github.com/danbugs/hyperlight.git", branch = "danbugs/fix-restore-rss-v0.16" }
+hyperlight-unikraft = { git = "https://github.com/danbugs/hl-uk-mini.git", default-features = false }

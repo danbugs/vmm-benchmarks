@@ -1,116 +1,22 @@
 /// Benchmark runner for hl-uk-mini (Hyperlight + Unikraft).
 ///
 /// Mirrors the hyperlight-runner interface so benchmark.py can drive
-/// both VMMs with the same command structure.  Uses the lower-level
-/// hyperlight-host API (GuestBinary::Buffer, Snapshot, map_file_cow)
-/// instead of the hyperlight-unikraft Sandbox builder.
+/// both VMMs with the same command structure.  Uses hyperlight-unikraft
+/// library for sandbox creation, host function registration, and
+/// snapshot restore — all benchmark-specific timing stays here.
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use hyperlight_host::{
-    GuestBinary, HostFunctions, MultiUseSandbox, UninitializedSandbox,
-    func::Registerable,
-    sandbox::{SandboxConfiguration, snapshot::{OciTag, Snapshot}},
+use hyperlight_unikraft::{
+    DEFAULT_SCRATCH_MB, SNAPSHOT_TAG,
+    create_sandbox, init, restore, run,
+    Exec, OciTag, Snapshot,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-// ── Embedded kernel ─────────────────────────────────────────────────────
-
-static KERNEL: &[u8] = include_bytes!("../kernel/elfloader_hyperlight-x86_64");
-
-// ── Constants ───────────────────────────────────────────────────────────
-
-const INITRD_MAP_BASE: u64 = 0xFEF0_0000;
-const DEFAULT_SCRATCH_MB: usize = 256;
-const HEAP_SIZE: u64 = 0x10_0000; // 1 MiB
-const SNAPSHOT_TAG: &str = "latest";
-
-// ── Host functions ──────────────────────────────────────────────────────
-
-fn paging_budget(scratch_size: usize) -> u64 {
-    (scratch_size as u64) * 3 / 4
-}
-
-fn exn_stack_top() -> u64 {
-    hyperlight_common::layout::SCRATCH_TOP_GVA as u64
-        - hyperlight_common::layout::SCRATCH_TOP_EXN_STACK_OFFSET
-        + 1
-}
-
-/// Scan a newc-format CPIO for `usr/local/bin/hl_*` or `usr/bin/hl_*`.
-fn find_cpio_entry(path: &Path) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut header = [0u8; 110];
-    loop {
-        if file.read_exact(&mut header).is_err() { break; }
-        let magic = std::str::from_utf8(&header[0..6]).ok()?;
-        if magic != "070701" && magic != "070702" { break; }
-        let namesize = u32::from_str_radix(std::str::from_utf8(&header[94..102]).ok()?, 16).ok()?;
-        let filesize = u64::from_str_radix(std::str::from_utf8(&header[54..62]).ok()?, 16).ok()?;
-        let mut name_buf = vec![0u8; namesize as usize];
-        file.read_exact(&mut name_buf).ok()?;
-        let name = std::str::from_utf8(&name_buf).ok()?.trim_end_matches('\0');
-        if name == "TRAILER!!!" { break; }
-        let name_padding = (4 - ((110 + namesize) % 4)) % 4;
-        file.seek(SeekFrom::Current(name_padding as i64)).ok()?;
-        if name.starts_with("usr/local/bin/hl_") || name.starts_with("usr/bin/hl_") {
-            return Some(format!("/{name}"));
-        }
-        let data_padding = (4 - (filesize % 4)) % 4;
-        file.seek(SeekFrom::Current((filesize + data_padding) as i64)).ok()?;
-    }
-    None
-}
-
-fn wall_clock_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-fn register_host_functions(
-    sandbox: &mut UninitializedSandbox,
-    cmdline: &str,
-    scratch_size: usize,
-    initrd_base: u64,
-    initrd_size: u64,
-) -> Result<()> {
-    let cmdline = cmdline.to_string();
-    sandbox.register("GetCmdLine", move || -> hyperlight_host::Result<String> {
-        Ok(cmdline.clone())
-    })?;
-    let budget = paging_budget(scratch_size);
-    sandbox.register("GetPagingBudget", move || -> hyperlight_host::Result<u64> { Ok(budget) })?;
-    sandbox.register("GetInitrdBase", move || -> hyperlight_host::Result<u64> { Ok(initrd_base) })?;
-    sandbox.register("GetInitrdSize", move || -> hyperlight_host::Result<u64> { Ok(initrd_size) })?;
-    let est = exn_stack_top();
-    sandbox.register("GetExnStackTop", move || -> hyperlight_host::Result<u64> { Ok(est) })?;
-    sandbox.register("GetWallClockNs", move || -> hyperlight_host::Result<u64> { Ok(wall_clock_ns()) })?;
-    Ok(())
-}
-
-fn build_host_functions() -> Result<HostFunctions> {
-    let mut hf = HostFunctions::default();
-    // Override the default green HostPrint — send guest output to
-    // stderr uncolored so it doesn't bleed ANSI into host output.
-    hf.register_host_function("HostPrint", |msg: String| -> hyperlight_host::Result<i32> {
-        eprint!("{msg}");
-        Ok(msg.len() as i32)
-    })?;
-    hf.register_host_function("GetCmdLine", || -> hyperlight_host::Result<String> { Ok(String::new()) })?;
-    hf.register_host_function("GetPagingBudget", || -> hyperlight_host::Result<u64> { Ok(0) })?;
-    hf.register_host_function("GetInitrdBase", || -> hyperlight_host::Result<u64> { Ok(0) })?;
-    hf.register_host_function("GetInitrdSize", || -> hyperlight_host::Result<u64> { Ok(0) })?;
-    hf.register_host_function("GetExnStackTop", || -> hyperlight_host::Result<u64> { Ok(exn_stack_top()) })?;
-    hf.register_host_function("GetWallClockNs", || -> hyperlight_host::Result<u64> { Ok(wall_clock_ns()) })?;
-    Ok(hf)
-}
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -120,42 +26,15 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
-fn evolve_sandbox(initrd: &Path, scratch_mb: usize) -> Result<MultiUseSandbox> {
-    let scratch_size = scratch_mb * 1024 * 1024;
-    let mut cfg = SandboxConfiguration::default();
-    cfg.set_scratch_size(scratch_size);
-    cfg.set_heap_size(HEAP_SIZE);
-
-    let mut usandbox = UninitializedSandbox::new(
-        GuestBinary::Buffer(KERNEL),
-        Some(cfg),
-    )?;
-
-    let initrd_size = usandbox.map_file_cow(initrd, INITRD_MAP_BASE)?;
-    let entry = find_cpio_entry(initrd).unwrap_or_default();
-    let cmdline = if entry.is_empty() {
-        "unikraft-hyperlight".to_string()
-    } else {
-        format!("unikraft-hyperlight {entry}")
-    };
-
-    register_host_functions(&mut usandbox, &cmdline, scratch_size, INITRD_MAP_BASE, initrd_size)?;
-    let sandbox = usandbox.evolve()?;
-    Ok(sandbox)
-}
-
 // ── Subcommands ─────────────────────────────────────────────────────────
 
 fn capture(initrd: &Path, snapshot_dir: &Path, scratch_mb: usize, warmup: bool) -> Result<()> {
-    let mut sandbox = evolve_sandbox(initrd, scratch_mb)?;
+    let (usandbox, _) = create_sandbox(&Some(initrd.to_path_buf()), &None, scratch_mb)?;
+    let mut sandbox = init(usandbox)?;
     if warmup {
-        // Warmup: import heavy modules so that demand-paged memory is
-        // faulted in before snapshotting.  Without this, snapshot
-        // restore + heavy scripts crash because the demand pager can't
-        // map new pages after restore.
-        sandbox.call::<()>(
-            "Exec",
-            "import re, xml.etree.ElementTree, zipfile, io, pathlib; pass".to_string(),
+        run(
+            &mut sandbox,
+            "import re, xml.etree.ElementTree, zipfile, io, pathlib; pass",
         )?;
     }
     let tag: OciTag = SNAPSHOT_TAG.parse()?;
@@ -165,31 +44,19 @@ fn capture(initrd: &Path, snapshot_dir: &Path, scratch_mb: usize, warmup: bool) 
     Ok(())
 }
 
-fn snapshot_generation(initrd: &Path, snapshot_dir: &Path, scratch_mb: usize, warmup: bool) -> Result<()> {
-    let scratch_size = scratch_mb * 1024 * 1024;
-    let mut cfg = SandboxConfiguration::default();
-    cfg.set_scratch_size(scratch_size);
-    cfg.set_heap_size(HEAP_SIZE);
-
+fn snapshot_generation(
+    initrd: &Path,
+    snapshot_dir: &Path,
+    scratch_mb: usize,
+    warmup: bool,
+) -> Result<()> {
     let t0 = Instant::now();
-    let mut usandbox = UninitializedSandbox::new(
-        GuestBinary::Buffer(KERNEL),
-        Some(cfg),
-    )?;
-
-    let initrd_size = usandbox.map_file_cow(initrd, INITRD_MAP_BASE)?;
-    let entry = find_cpio_entry(initrd).unwrap_or_default();
-    let cmdline = if entry.is_empty() {
-        "unikraft-hyperlight".to_string()
-    } else {
-        format!("unikraft-hyperlight {entry}")
-    };
-    register_host_functions(&mut usandbox, &cmdline, scratch_size, INITRD_MAP_BASE, initrd_size)?;
-    let mut sandbox = usandbox.evolve()?;
+    let (usandbox, _) = create_sandbox(&Some(initrd.to_path_buf()), &None, scratch_mb)?;
+    let mut sandbox = init(usandbox)?;
     if warmup {
-        sandbox.call::<()>(
-            "Exec",
-            "import re, xml.etree.ElementTree, zipfile, io, pathlib; pass".to_string(),
+        run(
+            &mut sandbox,
+            "import re, xml.etree.ElementTree, zipfile, io, pathlib; pass",
         )?;
     }
     let sandbox_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -212,27 +79,16 @@ fn snapshot_generation(initrd: &Path, snapshot_dir: &Path, scratch_mb: usize, wa
     Ok(())
 }
 
-fn restore(snapshot_dir: &Path, _initrd: Option<&Path>, script: Option<&Path>) -> Result<()> {
+fn cmd_restore(snapshot_dir: &Path, script: &Path) -> Result<()> {
     let tag: OciTag = SNAPSHOT_TAG.parse()?;
 
     let t0 = Instant::now();
-    let snap: Arc<Snapshot> = Arc::new(Snapshot::load(snapshot_dir, tag)?);
-    let hf = build_host_functions()?;
-    let mut sandbox = MultiUseSandbox::from_snapshot(snap, hf, None)?;
+    let snap = Arc::new(Snapshot::load(snapshot_dir, tag)?);
+    let mut sandbox = restore(snap)?;
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let t1 = Instant::now();
-    match script {
-        Some(path) => {
-            let source = fs::read_to_string(path)?;
-            sandbox.call::<()>("Exec", source)?;
-        }
-        None => {
-            // Non-script workloads (e.g. Node.js): the app runs to
-            // completion when we poke the guest dispatch.
-            sandbox.call::<()>("run", ())?;
-        }
-    }
+    run(&mut sandbox, Exec::File(script.to_path_buf()))?;
     let call_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
     println!("BENCHMARK_PHASE snapshot_load_ms={load_ms:.6} guest_call_ms={call_ms:.6}");
@@ -240,24 +96,21 @@ fn restore(snapshot_dir: &Path, _initrd: Option<&Path>, script: Option<&Path>) -
     Ok(())
 }
 
-fn warm(snapshot_dir: &Path, _initrd: Option<&Path>, script: Option<&Path>, iterations: usize) -> Result<()> {
+fn warm(snapshot_dir: &Path, script: &Path, iterations: usize) -> Result<()> {
     let tag: OciTag = SNAPSHOT_TAG.parse()?;
 
-    let source = script.map(fs::read_to_string).transpose()?;
+    // Pre-read script so file I/O doesn't pollute iteration timing.
+    let source = fs::read_to_string(script)?;
 
     let t0 = Instant::now();
-    let snap: Arc<Snapshot> = Arc::new(Snapshot::load(snapshot_dir, tag)?);
-    let hf = build_host_functions()?;
-    let mut sandbox = MultiUseSandbox::from_snapshot(snap.clone(), hf, None)?;
+    let snap = Arc::new(Snapshot::load(snapshot_dir, tag)?);
+    let mut sandbox = restore(snap.clone())?;
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!("BENCHMARK_PHASE snapshot_load_ms={load_ms:.6}");
 
     for i in 0..iterations {
         let t1 = Instant::now();
-        match &source {
-            Some(src) => sandbox.call::<()>("Exec", src.clone())?,
-            None => sandbox.call::<()>("run", ())?,
-        }
+        run(&mut sandbox, source.as_str())?;
         let call_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
@@ -274,19 +127,16 @@ fn warm(snapshot_dir: &Path, _initrd: Option<&Path>, script: Option<&Path>, iter
 }
 
 /// Cold start: fresh evolve + dispatch (no snapshot).
-/// Used for workloads where snapshot/restore doesn't work (e.g. Node.js).
-fn cold(initrd: &Path, script: Option<&Path>, scratch_mb: usize) -> Result<()> {
-    let source = match script {
-        Some(path) => fs::read_to_string(path)?,
-        None => return Err("cold requires a script argument".into()),
-    };
+fn cold(initrd: &Path, script: &Path, scratch_mb: usize) -> Result<()> {
+    let source = fs::read_to_string(script)?;
 
     let t0 = Instant::now();
-    let mut sandbox = evolve_sandbox(initrd, scratch_mb)?;
+    let (usandbox, _) = create_sandbox(&Some(initrd.to_path_buf()), &None, scratch_mb)?;
+    let mut sandbox = init(usandbox)?;
     let evolve_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let t1 = Instant::now();
-    sandbox.call::<()>("Exec", source)?;
+    run(&mut sandbox, source)?;
     let call_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
     println!("BENCHMARK_PHASE sandbox_build_ms={evolve_ms:.6} guest_call_ms={call_ms:.6}");
@@ -302,9 +152,9 @@ fn usage(program: &str) -> String {
          usage:\n\
          \n  {program} capture <initrd> <snapshot-dir> [--scratch-mb 256] [--warmup]\n\
          \n  {program} snapshot-generation <initrd> <snapshot-dir> [--scratch-mb 256] [--warmup]\n\
-         \n  {program} restore <snapshot-dir> [<script>] [--initrd <path>]\n\
-         \n  {program} warm <snapshot-dir> [<script>] [--iterations 10] [--initrd <path>]\n\
-         \n  {program} cold <initrd> [<script>] [--scratch-mb 256]"
+         \n  {program} restore <snapshot-dir> <script>\n\
+         \n  {program} warm <snapshot-dir> <script> [--iterations 10]\n\
+         \n  {program} cold <initrd> <script> [--scratch-mb 256]"
     )
 }
 
@@ -325,7 +175,6 @@ fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
     let warmup = args.iter().any(|a| a == "--warmup");
-    let initrd = flag_value(&args, "--initrd").map(|v| std::path::PathBuf::from(v));
 
     match args.get(1).map(String::as_str) {
         Some("capture") if args.len() >= 4 => {
@@ -334,23 +183,14 @@ fn main() -> Result<()> {
         Some("snapshot-generation") if args.len() >= 4 => {
             snapshot_generation(Path::new(&args[2]), Path::new(&args[3]), scratch_mb, warmup)
         }
-        Some("restore") if args.len() >= 3 => {
-            let script = args.get(3)
-                .filter(|s| !s.starts_with("--"))
-                .map(|s| Path::new(s.as_str()));
-            restore(Path::new(&args[2]), initrd.as_deref(), script)
+        Some("restore") if args.len() >= 4 => {
+            cmd_restore(Path::new(&args[2]), Path::new(&args[3]))
         }
-        Some("warm") if args.len() >= 3 => {
-            let script = args.get(3)
-                .filter(|s| !s.starts_with("--"))
-                .map(|s| Path::new(s.as_str()));
-            warm(Path::new(&args[2]), initrd.as_deref(), script, iterations)
+        Some("warm") if args.len() >= 4 => {
+            warm(Path::new(&args[2]), Path::new(&args[3]), iterations)
         }
-        Some("cold") if args.len() >= 3 => {
-            let script = args.get(3)
-                .filter(|s| !s.starts_with("--"))
-                .map(|s| Path::new(s.as_str()));
-            cold(Path::new(&args[2]), script, scratch_mb)
+        Some("cold") if args.len() >= 4 => {
+            cold(Path::new(&args[2]), Path::new(&args[3]), scratch_mb)
         }
         _ => Err(usage(&args[0]).into()),
     }
