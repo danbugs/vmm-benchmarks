@@ -105,6 +105,13 @@ HYPERLIGHT_EMBEDDED_MARKERS = {
 HYPERLIGHT_PYHL_WORKLOADS = {"hello", "pandoc-docx-stdlib"}
 NVX_PYTHON_WORKLOADS = {"hello", "pandoc-docx-stdlib", "pandoc-docx"}
 NVX_MOUNTED_EXEC_WORKLOADS = {"pandoc-native", "nodejs-hello"}
+# hl-uk-mini dispatches scripts via Exec for these workloads (Python + Node.js)
+HL_UK_MINI_EXEC_WORKLOADS = {"hello", "pandoc-docx-stdlib", "nodejs-hello"}
+# When hl-uk-mini needs a different sample format than the default WORKLOAD_SAMPLES
+# entry (e.g. pure JS instead of shell script for NVX)
+HL_UK_MINI_SAMPLE_OVERRIDES: dict[str, Path] = {
+    "nodejs-hello": NODEJS_RUNTIME_SAMPLE,
+}
 HL_UK_MINI_PYTHON_INITRD = HL_UK_MINI_RUNNER_DIR / "python-rootfs.cpio"
 HL_UK_MINI_NODE_INITRD = HL_UK_MINI_RUNNER_DIR / "node-rootfs.cpio"
 HL_UK_MINI_INITRD_IMAGES: dict[str, tuple[str, Path]] = {
@@ -165,7 +172,7 @@ WORKLOAD_SAMPLE_VMMS: dict[str, tuple[str, ...]] = {
     "pandoc-docx-stdlib": ("nvx", "hyperlight", "hl-uk-mini"),
     "pandoc-docx": ("nvx",),
     "pandoc-native": ("nvx",),
-    "nodejs-hello": ("nvx",),
+    "nodejs-hello": ("nvx", "hl-uk-mini"),
     "nodejs-compile-test": (),
 }
 WORKLOAD_MARKERS = {
@@ -1461,6 +1468,24 @@ def prepare(
         and ("nvx" in selected or "nvx" in previous_vmms)
         else None
     )
+    # Stage per-VMM sample override for hl-uk-mini (e.g. pure JS
+    # instead of the shell script used by NVX for nodejs-hello)
+    mini_sample_override_source = HL_UK_MINI_SAMPLE_OVERRIDES.get(workload)
+    mini_sample_override: Path | None = (
+        stage_sample(
+            output_dir,
+            artifacts,
+            mini_sample_override_source,
+            allow_initial_with_results=(
+                bool(previous_vmms) and "hl-uk-mini" not in previous_vmms
+            ),
+        )
+        if (
+            mini_sample_override_source is not None
+            and ("hl-uk-mini" in selected or "hl-uk-mini" in previous_vmms)
+        )
+        else None
+    )
     memory = GUEST_MEMORY_MIB[workload]
     marker = WORKLOAD_MARKERS[workload]
     warmup_imports = (
@@ -2201,18 +2226,25 @@ def prepare(
             reset_path=mini_generation_snapshot,
             success_paths=(mini_generation_snapshot / "index.json",),
         )
-        if workload in HYPERLIGHT_PYHL_WORKLOADS:
-            assert sample is not None
+        if workload in HL_UK_MINI_EXEC_WORKLOADS:
+            # Use the per-VMM sample override if one exists (e.g. pure
+            # JS for nodejs-hello), otherwise fall back to the default.
+            mini_sample = (
+                mini_sample_override
+                if mini_sample_override is not None
+                else sample
+            )
+            assert mini_sample is not None
             mini_restore_args = (
-                "restore", str(mini_snapshot), str(sample),
+                "restore", str(mini_snapshot), str(mini_sample),
                 "--initrd", str(mini_initrd),
             )
             mini_warm_args = (
-                "warm", str(mini_snapshot), str(sample),
+                "warm", str(mini_snapshot), str(mini_sample),
                 "--initrd", str(mini_initrd),
             )
         else:
-            # Non-script workloads (Node.js): no sample, runner calls
+            # Non-script workloads: no sample, runner calls
             # call("run", ()) to dispatch the app to completion.
             mini_restore_args = (
                 "restore", str(mini_snapshot),
@@ -2316,9 +2348,11 @@ def prepare(
         }
     if workload in HYPERLIGHT_PYHL_WORKLOADS:
         delivery["hyperlight"] = {"method": "function_call", "function": "run"}
-        delivery["hl-uk-mini"] = {"method": "function_call", "function": "Exec"}
     else:
         delivery["hyperlight"] = {"method": "embedded_in_initrd"}
+    if workload in HL_UK_MINI_EXEC_WORKLOADS:
+        delivery["hl-uk-mini"] = {"method": "function_call", "function": "Exec"}
+    else:
         delivery["hl-uk-mini"] = {"method": "embedded_in_initrd"}
     previous_snapshot_policy_value = previous_manifest.get("snapshot_policy")
     previous_snapshot_policy = (
@@ -2382,7 +2416,11 @@ def prepare(
             else "initialized_unikraft_elfloader"
         )
     if "hl-uk-mini" in selected:
-        capture_points["hl-uk-mini"] = "initialized_cpython_elfloader"
+        capture_points["hl-uk-mini"] = (
+            "initialized_cpython_elfloader"
+            if workload in HYPERLIGHT_PYHL_WORKLOADS
+            else "initialized_nodejs_elfloader"
+        )
     missing_capture_points = manifest_vmms - capture_points.keys()
     if missing_capture_points:
         missing = ", ".join(sorted(missing_capture_points))
@@ -2436,12 +2474,21 @@ def prepare(
             continue
 
         if vmm in WORKLOAD_SAMPLE_VMMS[workload]:
-            assert sample is not None and workload_sample_source is not None
-            record: dict[str, object] = {
-                "source": str(workload_sample_source.relative_to(SCRIPT_DIR)),
-                "sha256": sha256(sample),
-                "delivery": delivery[vmm],
-            }
+            # Use the per-VMM sample override when applicable
+            if vmm == "hl-uk-mini" and mini_sample_override is not None:
+                assert mini_sample_override_source is not None
+                record: dict[str, object] = {
+                    "source": str(mini_sample_override_source.relative_to(SCRIPT_DIR)),
+                    "sha256": sha256(mini_sample_override),
+                    "delivery": delivery[vmm],
+                }
+            else:
+                assert sample is not None and workload_sample_source is not None
+                record: dict[str, object] = {
+                    "source": str(workload_sample_source.relative_to(SCRIPT_DIR)),
+                    "sha256": sha256(sample),
+                    "delivery": delivery[vmm],
+                }
         else:
             record = {
                 "source": "embedded_in_initrd",
@@ -4063,10 +4110,21 @@ def write_report(
                     "image entry point after restore."
                 )
         if "hl-uk-mini" in included_vmms:
-            snapshot_method_lines.append(
-                "- HL-UK-Mini snapshots an initialized CPython elfloader (no warmup), "
-                "then passes the sample source to its `Exec` function after restore."
-            )
+            if workload in HYPERLIGHT_PYHL_WORKLOADS:
+                snapshot_method_lines.append(
+                    "- HL-UK-Mini snapshots an initialized CPython elfloader (no warmup), "
+                    "then passes the sample source to its `Exec` function after restore."
+                )
+            elif workload in HL_UK_MINI_EXEC_WORKLOADS:
+                snapshot_method_lines.append(
+                    "- HL-UK-Mini snapshots an initialized Node.js elfloader, "
+                    "then passes JavaScript source to its `Exec` function after restore."
+                )
+            else:
+                snapshot_method_lines.append(
+                    "- HL-UK-Mini snapshots its initialized elfloader image and invokes the "
+                    "entry point after restore."
+                )
     else:
         snapshot_method_lines = [
             "- This result predates explicit snapshot-policy metadata; generic warmup and "

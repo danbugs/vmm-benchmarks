@@ -97,6 +97,12 @@ fn register_host_functions(
 
 fn build_host_functions() -> Result<HostFunctions> {
     let mut hf = HostFunctions::default();
+    // Override the default green HostPrint — send guest output to
+    // stderr uncolored so it doesn't bleed ANSI into host output.
+    hf.register_host_function("HostPrint", |msg: String| -> hyperlight_host::Result<i32> {
+        eprint!("{msg}");
+        Ok(msg.len() as i32)
+    })?;
     hf.register_host_function("GetCmdLine", || -> hyperlight_host::Result<String> { Ok(String::new()) })?;
     hf.register_host_function("GetPagingBudget", || -> hyperlight_host::Result<u64> { Ok(0) })?;
     hf.register_host_function("GetInitrdBase", || -> hyperlight_host::Result<u64> { Ok(0) })?;
